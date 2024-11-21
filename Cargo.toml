@@ -1,0 +1,16 @@
+[package]
+name = "lockmap"
+version = "0.1.0"
+edition = "2021"
+
+authors = ["SF-Zhou <sfzhou.scut@gmail.com>"]
+homepage = "https://github.com/SF-Zhou/lockmap"
+repository = "https://github.com/SF-Zhou/lockmap"
+description = "A high-performance, thread-safe HashMap implementation for Rust that provides fine-grained locking at the key level."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+atomic-wait = "1"
+
+[dev-dependencies]
+rand = "0"
