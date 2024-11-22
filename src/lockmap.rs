@@ -113,7 +113,28 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized + ToOwned<Owned = K>,
     {
-        let ptr = self.lock(key);
+        let waiter = AtomicU32::new(0);
+        let ptr = self.map.update(key, |value| match value {
+            Some(state) => {
+                if state.queue.is_empty() {
+                    // no need to wait.
+                    waiter.store(1, Ordering::Release);
+                }
+                state.queue.push_back(WaiterPtr::new(&waiter));
+                (Action::Keep, state.value.as_mut() as *mut _)
+            }
+            None => {
+                let mut state = State::default();
+                // no need to wait.
+                state.queue.push_back(WaiterPtr::new(&waiter));
+                let ptr = state.value.as_mut() as *mut _;
+                waiter.store(1, Ordering::Release);
+                (Action::Update(state), ptr)
+            }
+        });
+
+        WaiterPtr::wait(&waiter);
+
         Entry {
             map: self,
             key,
@@ -149,7 +170,39 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized + ToOwned<Owned = K>,
     {
-        self.set_value(key, Some(value));
+        let waiter = AtomicU32::new(0);
+        let mut ptr: *mut Option<V> = std::ptr::null_mut();
+        let value = self.map.update(key, |v| match v {
+            Some(state) => {
+                if state.queue.is_empty() {
+                    // no need to wait.
+                    state.value.replace(value);
+                    (Action::Keep, None)
+                } else {
+                    // need to wait.
+                    state.queue.push_back(WaiterPtr::new(&waiter));
+                    ptr = state.value.as_mut() as *mut _;
+                    (Action::Keep, Some(value))
+                }
+            }
+            None => {
+                // no need to wait.
+                let state = State {
+                    value: Box::new(Some(value)),
+                    queue: Default::default(),
+                };
+                (Action::Update(state), None)
+            }
+        });
+
+        if ptr.is_null() {
+            return;
+        }
+
+        WaiterPtr::wait(&waiter);
+
+        *Self::value_ptr_to_ref(ptr) = value;
+        self.unlock(key);
     }
 
     /// Removes a key from the map.
@@ -176,35 +229,29 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized + ToOwned<Owned = K>,
     {
-        self.set_value(key, None);
-    }
-
-    fn lock<Q>(&self, key: &Q) -> *mut Option<V>
-    where
-        K: Borrow<Q>,
-        Q: Eq + Hash + ?Sized + ToOwned<Owned = K>,
-    {
         let waiter = AtomicU32::new(0);
-        let ptr = self.map.update(key, |value| match value {
+        let ptr = self.map.update(key, |v| match v {
             Some(state) => {
                 if state.queue.is_empty() {
-                    waiter.store(1, Ordering::Release);
+                    // no need to wait.
+                    (Action::Remove, std::ptr::null_mut())
+                } else {
+                    // need to wait.
+                    state.queue.push_back(WaiterPtr::new(&waiter));
+                    (Action::Keep, state.value.as_mut() as *mut Option<V>)
                 }
-                state.queue.push_back(WaiterPtr::new(&waiter));
-                (Action::Keep, state.value.as_mut() as *mut _)
             }
-            None => {
-                let mut state = State::default();
-                state.queue.push_back(WaiterPtr::new(&waiter));
-                let ptr = state.value.as_mut() as *mut _;
-                waiter.store(1, Ordering::Release);
-                (Action::Update(state), ptr)
-            }
+            None => (Action::Keep, std::ptr::null_mut()), // no need to wait.
         });
+
+        if ptr.is_null() {
+            return;
+        }
 
         WaiterPtr::wait(&waiter);
 
-        ptr
+        Self::value_ptr_to_ref(ptr).take();
+        self.unlock(key);
     }
 
     fn unlock<Q>(&self, key: &Q)
@@ -228,43 +275,6 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
             None if state.value.is_none() => Action::Remove,
             None => Action::Keep,
         }
-    }
-
-    fn set_value<Q>(&self, key: &Q, value: Option<V>)
-    where
-        K: Borrow<Q>,
-        Q: Eq + Hash + ?Sized + ToOwned<Owned = K>,
-    {
-        let waiter = AtomicU32::new(0);
-        let mut ptr: *mut Option<V> = std::ptr::null_mut();
-        let value = self.map.update(key, |v| match v {
-            Some(state) => {
-                if state.queue.is_empty() {
-                    // no need to wait.
-                    *state.value = value;
-                    (Action::Keep, None)
-                } else {
-                    // need to wait.
-                    state.queue.push_back(WaiterPtr::new(&waiter));
-                    ptr = state.value.as_mut() as *mut _;
-                    (Action::Keep, value)
-                }
-            }
-            None => {
-                let mut state = State::default();
-                *state.value = value;
-                (Action::Update(state), None)
-            }
-        });
-
-        if ptr.is_null() {
-            return;
-        }
-
-        WaiterPtr::wait(&waiter);
-
-        *Self::value_ptr_to_ref(ptr) = value;
-        self.unlock(key);
     }
 
     fn value_ptr_to_ref<'env>(ptr: *mut Option<V>) -> &'env mut Option<V> {
