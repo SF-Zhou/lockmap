@@ -17,15 +17,16 @@
 //! let map = LockMap::<String, u32>::new();
 //!
 //! // Basic operations
-//! map.set("key1", 42);
-//! assert_eq!(map.get("key1"), Some(42));
+//! map.set("key1".into(), 42);
+//! assert_eq!(map.get("key1".into()), Some(42));
 //!
 //! // Entry API for exclusive access
 //! {
-//!     let entry = map.entry("key2");
+//!     let entry = map.entry("key2".into());
 //!     entry.value.replace(123);
 //! }
 //! ```
+#[doc = include_str!("../README.md")]
 mod lockmap;
 mod shards_map;
 mod waiter;
