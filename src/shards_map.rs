@@ -51,10 +51,53 @@ where
     /// # Returns
     ///
     /// The result returned by the provided function.
-    pub fn update<Q, F, R>(&self, key: &Q, func: F) -> R
+    pub fn update<F, R>(&self, key: K, func: F) -> R
     where
-        K: Borrow<Q>,
-        Q: Eq + Hash + ?Sized + ToOwned<Owned = K>,
+        F: FnOnce(Option<&mut V>) -> (Action<V>, R),
+    {
+        let mut map = self.map.lock().unwrap();
+        match map.get_mut(&key) {
+            Some(value) => {
+                let (action, ret) = func(Some(value));
+                match action {
+                    Action::Keep => {}
+                    Action::Remove => {
+                        map.remove(&key);
+                    }
+                    Action::Update(value) => {
+                        map.insert(key, value);
+                    }
+                }
+                ret
+            }
+            None => {
+                let (action, ret) = func(None);
+                match action {
+                    Action::Keep => {}
+                    Action::Remove => {}
+                    Action::Update(value) => {
+                        map.insert(key, value);
+                    }
+                }
+                ret
+            }
+        }
+    }
+
+    /// Updates the value associated with the given key using the provided function.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to update.
+    /// * `func` - A function that takes an `Option<&mut V>` and returns a tuple containing the action to take and the result.
+    ///
+    /// # Returns
+    ///
+    /// The result returned by the provided function.
+    pub fn update_by_ref<Q, F, R>(&self, key: &Q, func: F) -> R
+    where
+        K: Borrow<Q> + for<'c> From<&'c Q>,
+        Q: Eq + Hash + ?Sized,
         F: FnOnce(Option<&mut V>) -> (Action<V>, R),
     {
         let mut map = self.map.lock().unwrap();
@@ -67,7 +110,7 @@ where
                         map.remove(key);
                     }
                     Action::Update(value) => {
-                        map.insert(key.to_owned(), value);
+                        map.insert(key.into(), value);
                     }
                 }
                 ret
@@ -78,7 +121,7 @@ where
                     Action::Keep => {}
                     Action::Remove => {}
                     Action::Update(value) => {
-                        map.insert(key.to_owned(), value);
+                        map.insert(key.into(), value);
                     }
                 }
                 ret
@@ -126,16 +169,36 @@ where
     /// # Returns
     ///
     /// The result returned by the provided function.
-    pub fn update<Q, F, R>(&self, key: &Q, func: F) -> R
+    pub fn update<F, R>(&self, key: K, func: F) -> R
     where
-        K: Borrow<Q>,
-        Q: Eq + Hash + ?Sized + ToOwned<Owned = K>,
         F: FnOnce(Option<&mut V>) -> (Action<V>, R),
     {
         let mut s = DefaultHasher::new();
         key.hash(&mut s);
         let idx = s.finish() as usize % self.shards.len();
         self.shards[idx].update(key, func)
+    }
+
+    /// Updates the value associated with the given key using the provided function.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to update.
+    /// * `func` - A function that takes an `Option<&mut V>` and returns a tuple containing the action to take and the result.
+    ///
+    /// # Returns
+    ///
+    /// The result returned by the provided function.
+    pub fn update_by_ref<Q, F, R>(&self, key: &Q, func: F) -> R
+    where
+        K: Borrow<Q> + for<'c> From<&'c Q>,
+        Q: Eq + Hash + ?Sized,
+        F: FnOnce(Option<&mut V>) -> (Action<V>, R),
+    {
+        let mut s = DefaultHasher::new();
+        key.hash(&mut s);
+        let idx = s.finish() as usize % self.shards.len();
+        self.shards[idx].update_by_ref(key, func)
     }
 }
 
@@ -151,31 +214,31 @@ mod tests {
     #[test]
     fn test_shards_map() {
         let shards_map = ShardsMap::<u32, u32>::with_capacity_and_shard_amount(256, 16);
-        shards_map.update(&1, |v| {
+        shards_map.update(1, |v| {
             assert_eq!(v, None);
             (Action::Update(1), ())
         });
-        shards_map.update(&2, |v| {
+        shards_map.update(2, |v| {
             assert_eq!(v, None);
             (Action::Keep, ())
         });
-        shards_map.update(&3, |v| {
+        shards_map.update(3, |v| {
             assert_eq!(v, None);
             (Action::Remove, ())
         });
-        shards_map.update(&1, |v| {
+        shards_map.update(1, |v| {
             assert_eq!(v.cloned(), Some(1));
             (Action::Update(2), ())
         });
-        shards_map.update(&1, |v| {
+        shards_map.update(1, |v| {
             assert_eq!(v.cloned(), Some(2));
             (Action::Keep, ())
         });
-        shards_map.update(&1, |v| {
+        shards_map.update(1, |v| {
             assert_eq!(v.cloned(), Some(2));
             (Action::Remove, ())
         });
-        shards_map.update(&1, |v| {
+        shards_map.update(1, |v| {
             assert_eq!(v, None);
             (Action::Remove, ())
         });
@@ -184,13 +247,29 @@ mod tests {
     #[test]
     fn test_shards_map_2() {
         let shards_map = ShardsMap::<String, String>::with_capacity_and_shard_amount(256, 16);
-        shards_map.update("hello", |v| {
+        shards_map.update_by_ref("hello", |v| {
             assert_eq!(v, None);
             (Action::Update("world".to_string()), ())
         });
-        shards_map.update("hello", |v| {
-            assert_eq!(v.cloned(), Some("world".into()));
+        shards_map.update_by_ref("hello", |v| {
+            assert_eq!(v.unwrap(), "world");
+            (Action::Update("lockmap".to_string()), ())
+        });
+        shards_map.update_by_ref("hello", |v| {
+            assert_eq!(v.unwrap(), "lockmap");
             (Action::Remove, ())
+        });
+        shards_map.update_by_ref("hello", |v| {
+            assert_eq!(v, None);
+            (Action::Remove, ())
+        });
+        shards_map.update_by_ref("hello", |v| {
+            assert_eq!(v, None);
+            (Action::Keep, ())
+        });
+        shards_map.update_by_ref(&"hello".to_owned(), |v| {
+            assert_eq!(v, None);
+            (Action::Keep, ())
         });
     }
 
@@ -203,7 +282,7 @@ mod tests {
         const N: usize = 1 << 12;
         const M: usize = 8;
 
-        lock_map.update(&1, |_| (Action::Update(0), ()));
+        lock_map.update(1, |_| (Action::Update(0), ()));
 
         let threads = (0..M)
             .map(|_| {
@@ -211,7 +290,7 @@ mod tests {
                 let current = current.clone();
                 std::thread::spawn(move || {
                     for _ in 0..N {
-                        lock_map.update(&1, |v| {
+                        lock_map.update(1, |v| {
                             let now = current.fetch_add(1, Ordering::AcqRel);
                             assert_eq!(now, 0);
                             *v.unwrap() += 1;
@@ -226,7 +305,7 @@ mod tests {
         threads.into_iter().for_each(|t| t.join().unwrap());
 
         assert_eq!(
-            lock_map.update(&1, |v| (Action::Update(0), *v.unwrap())),
+            lock_map.update(1, |v| (Action::Update(0), *v.unwrap())),
             N * M
         );
     }

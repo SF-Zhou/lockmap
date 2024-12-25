@@ -13,20 +13,20 @@ A high-performance, thread-safe HashMap implementation for Rust that provides fi
 use lockmap::LockMap;
 
 // Create a new lock map
-let map = LockMap::new();
+let map = LockMap::<String, String>::new();
 
 // Set a value
-map.set("key", "value");
+map.set_by_ref("key", "value".into());
 
 // Get a value
-assert_eq!(map.get("key"), Some("value"));
+assert_eq!(map.get_by_ref("key"), Some("value".into()));
 
 // Use entry API for exclusive access
 {
-    let entry = map.entry("key");
-    *entry.value = Some("new value");
+    let entry = map.entry_by_ref("key");
+    *entry.value = Some("new value".into());
 }
 
 // Remove a value
-map.remove("key");
+map.remove_by_ref("key");
 ```
