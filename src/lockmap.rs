@@ -1,4 +1,4 @@
-use crate::{Action, ShardsMap, WaiterPtr};
+use crate::{ShardsMap, SimpleAction, UpdateAction, WaiterPtr};
 use std::borrow::Borrow;
 use std::collections::LinkedList;
 use std::hash::Hash;
@@ -120,7 +120,7 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
                     waiter.store(1, Ordering::Release);
                 }
                 state.queue.push_back(WaiterPtr::new(&waiter));
-                (Action::Keep, state.value.as_mut() as *mut _)
+                (UpdateAction::Keep, state.value.as_mut() as *mut _)
             }
             None => {
                 let mut state = State::default();
@@ -128,7 +128,7 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
                 state.queue.push_back(WaiterPtr::new(&waiter));
                 let ptr = state.value.as_mut() as *mut _;
                 waiter.store(1, Ordering::Release);
-                (Action::Update(state), ptr)
+                (UpdateAction::Update(state), ptr)
             }
         });
 
@@ -155,9 +155,9 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
     /// {
     ///     let mut entry = map.entry_by_ref("key");
     ///     entry.value.replace(42);
-    ///     // let _ = map.get_by_ref("key"); // DEADLOCK!
+    ///     // let _ = map.get("key"); // DEADLOCK!
     ///     // map.set_by_ref("key", 21); // DEADLOCK!
-    ///     // map.remove_by_ref("key"); // DEADLOCK!
+    ///     // map.remove("key"); // DEADLOCK!
     ///     // let mut entry2 = map.entry_by_ref("key"); // DEADLOCK!
     /// }
     /// ```
@@ -174,7 +174,7 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
                     waiter.store(1, Ordering::Release);
                 }
                 state.queue.push_back(WaiterPtr::new(&waiter));
-                (Action::Keep, state.value.as_mut() as *mut _)
+                (UpdateAction::Keep, state.value.as_mut() as *mut _)
             }
             None => {
                 let mut state = State::default();
@@ -182,7 +182,7 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
                 state.queue.push_back(WaiterPtr::new(&waiter));
                 let ptr = state.value.as_mut() as *mut _;
                 waiter.store(1, Ordering::Release);
-                (Action::Update(state), ptr)
+                (UpdateAction::Update(state), ptr)
             }
         });
 
@@ -226,12 +226,12 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
                 if state.queue.is_empty() {
                     // no need to wait.
                     state.value.replace(value);
-                    (Action::Keep, None)
+                    (UpdateAction::Keep, None)
                 } else {
                     // need to wait.
                     state.queue.push_back(WaiterPtr::new(&waiter));
                     ptr = state.value.as_mut() as *mut _;
-                    (Action::Keep, Some(value))
+                    (UpdateAction::Keep, Some(value))
                 }
             }
             None => {
@@ -240,7 +240,7 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
                     value: Box::new(Some(value)),
                     queue: Default::default(),
                 };
-                (Action::Update(state), None)
+                (UpdateAction::Update(state), None)
             }
         });
 
@@ -251,7 +251,7 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
         WaiterPtr::wait(&waiter);
 
         *Self::value_ptr_to_ref(ptr) = value;
-        self.unlock(key);
+        self.unlock(&key);
     }
 
     /// Sets a value in the map.
@@ -289,12 +289,12 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
                 if state.queue.is_empty() {
                     // no need to wait.
                     state.value.replace(value);
-                    (Action::Keep, None)
+                    (UpdateAction::Keep, None)
                 } else {
                     // need to wait.
                     state.queue.push_back(WaiterPtr::new(&waiter));
                     ptr = state.value.as_mut() as *mut _;
-                    (Action::Keep, Some(value))
+                    (UpdateAction::Keep, Some(value))
                 }
             }
             None => {
@@ -303,7 +303,7 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
                     value: Box::new(Some(value)),
                     queue: Default::default(),
                 };
-                (Action::Update(state), None)
+                (UpdateAction::Update(state), None)
             }
         });
 
@@ -314,51 +314,6 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
         WaiterPtr::wait(&waiter);
 
         *Self::value_ptr_to_ref(ptr) = value;
-        self.unlock_by_ref(key);
-    }
-
-    /// Removes a key from the map.
-    ///
-    /// If other threads are currently accessing the key, this will wait
-    /// until exclusive access is available before removing.
-    ///
-    /// # Arguments
-    /// * `key` - The key to remove
-    ///
-    /// **Locking behaviour:** Deadlock if called when holding the same entry.
-    ///
-    /// # Examples
-    /// ```
-    /// use lockmap::LockMap;
-    ///
-    /// let map = LockMap::<String, u32>::new();
-    /// map.set("key".to_string(), 42);
-    /// map.remove("key".to_string());
-    /// assert_eq!(map.get("key".to_string()), None);
-    /// ```
-    pub fn remove(&self, key: K) {
-        let waiter = AtomicU32::new(0);
-        let ptr = self.map.update(key.clone(), |v| match v {
-            Some(state) => {
-                if state.queue.is_empty() {
-                    // no need to wait.
-                    (Action::Remove, std::ptr::null_mut())
-                } else {
-                    // need to wait.
-                    state.queue.push_back(WaiterPtr::new(&waiter));
-                    (Action::Keep, state.value.as_mut() as *mut Option<V>)
-                }
-            }
-            None => (Action::Keep, std::ptr::null_mut()), // no need to wait.
-        });
-
-        if ptr.is_null() {
-            return;
-        }
-
-        WaiterPtr::wait(&waiter);
-
-        Self::value_ptr_to_ref(ptr).take();
         self.unlock(key);
     }
 
@@ -378,27 +333,27 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
     ///
     /// let map = LockMap::<String, u32>::new();
     /// map.set_by_ref("key", 42);
-    /// map.remove_by_ref("key");
-    /// assert_eq!(map.get_by_ref("key"), None);
+    /// map.remove("key");
+    /// assert_eq!(map.get("key"), None);
     /// ```
-    pub fn remove_by_ref<Q>(&self, key: &Q)
+    pub fn remove<Q>(&self, key: &Q)
     where
-        K: Borrow<Q> + for<'c> From<&'c Q>,
+        K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
         let waiter = AtomicU32::new(0);
-        let ptr = self.map.update_by_ref(key, |v| match v {
+        let ptr = self.map.simple_update(key, |v| match v {
             Some(state) => {
                 if state.queue.is_empty() {
                     // no need to wait.
-                    (Action::Remove, std::ptr::null_mut())
+                    (SimpleAction::Remove, std::ptr::null_mut())
                 } else {
                     // need to wait.
                     state.queue.push_back(WaiterPtr::new(&waiter));
-                    (Action::Keep, state.value.as_mut() as *mut Option<V>)
+                    (SimpleAction::Keep, state.value.as_mut() as *mut Option<V>)
                 }
             }
-            None => (Action::Keep, std::ptr::null_mut()), // no need to wait.
+            None => (SimpleAction::Keep, std::ptr::null_mut()), // no need to wait.
         });
 
         if ptr.is_null() {
@@ -408,36 +363,29 @@ impl<K: Eq + Hash + Clone, V> LockMap<K, V> {
         WaiterPtr::wait(&waiter);
 
         Self::value_ptr_to_ref(ptr).take();
-        self.unlock_by_ref(key);
+        self.unlock(key);
     }
 
-    fn unlock(&self, key: K) {
-        self.map.update(key, |value| match value {
-            Some(state) => (Self::wake_up_next_one(state), ()),
-            None => panic!("impossible: unlock a non-existent key!"),
-        });
-    }
-
-    fn unlock_by_ref<Q>(&self, key: &Q)
+    fn unlock<Q>(&self, key: &Q)
     where
-        K: Borrow<Q> + for<'c> From<&'c Q>,
+        K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.map.update_by_ref(key, |value| match value {
+        self.map.simple_update(key, |value| match value {
             Some(state) => (Self::wake_up_next_one(state), ()),
             None => panic!("impossible: unlock a non-existent key!"),
         });
     }
 
-    fn wake_up_next_one(state: &mut State<V>) -> Action<State<V>> {
+    fn wake_up_next_one(state: &mut State<V>) -> SimpleAction {
         state.queue.pop_front();
         match state.queue.front() {
             Some(waiter) => {
                 waiter.wake_up();
-                Action::Keep
+                SimpleAction::Keep
             }
-            None if state.value.is_none() => Action::Remove,
-            None => Action::Keep,
+            None if state.value.is_none() => SimpleAction::Remove,
+            None => SimpleAction::Keep,
         }
     }
 
@@ -466,26 +414,30 @@ impl<K: Eq + Hash + Clone, V: Clone> LockMap<K, V> {
     /// use lockmap::LockMap;
     ///
     /// let map = LockMap::<String, u32>::new();
-    /// map.set("key".to_string(), 42);
-    /// assert_eq!(map.get("key".to_string()), Some(42));
-    /// assert_eq!(map.get("missing".to_string()), None);
+    /// map.set_by_ref("key", 42);
+    /// assert_eq!(map.get("key"), Some(42));
+    /// assert_eq!(map.get("missing"), None);
     /// ```
-    pub fn get(&self, key: K) -> Option<V> {
+    pub fn get<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
         let waiter = AtomicU32::new(0);
         let mut ptr: *mut Option<V> = std::ptr::null_mut();
-        let value = self.map.update(key.clone(), |value| match value {
+        let value = self.map.simple_update(key, |value| match value {
             Some(state) => {
                 if state.queue.is_empty() {
                     // no need to wait.
-                    (Action::Keep, state.value.as_mut().clone())
+                    (SimpleAction::Keep, state.value.as_mut().clone())
                 } else {
                     // need to wait.
                     state.queue.push_back(WaiterPtr::new(&waiter));
                     ptr = state.value.as_mut() as *mut _;
-                    (Action::Keep, None)
+                    (SimpleAction::Keep, None)
                 }
             }
-            None => (Action::Keep, None),
+            None => (SimpleAction::Keep, None),
         });
 
         if ptr.is_null() {
@@ -496,62 +448,6 @@ impl<K: Eq + Hash + Clone, V: Clone> LockMap<K, V> {
 
         let value = Self::value_ptr_to_ref(ptr).clone();
         self.unlock(key);
-        value
-    }
-
-    /// Gets the value associated with the given key.
-    ///
-    /// If other threads are currently accessing the key, this will wait
-    /// until exclusive access is available before returning.
-    ///
-    /// # Arguments
-    /// * `key` - The key to look up
-    ///
-    /// # Returns
-    /// * `Some(V)` if the key exists
-    /// * `None` if the key doesn't exist
-    ///
-    /// **Locking behaviour:** Deadlock if called when holding the same entry.
-    ///
-    /// # Examples
-    /// ```
-    /// use lockmap::LockMap;
-    ///
-    /// let map = LockMap::<String, u32>::new();
-    /// map.set_by_ref("key", 42);
-    /// assert_eq!(map.get_by_ref("key"), Some(42));
-    /// assert_eq!(map.get_by_ref("missing"), None);
-    /// ```
-    pub fn get_by_ref<Q>(&self, key: &Q) -> Option<V>
-    where
-        K: Borrow<Q> + for<'c> From<&'c Q>,
-        Q: Eq + Hash + ?Sized,
-    {
-        let waiter = AtomicU32::new(0);
-        let mut ptr: *mut Option<V> = std::ptr::null_mut();
-        let value = self.map.update_by_ref(key, |value| match value {
-            Some(state) => {
-                if state.queue.is_empty() {
-                    // no need to wait.
-                    (Action::Keep, state.value.as_mut().clone())
-                } else {
-                    // need to wait.
-                    state.queue.push_back(WaiterPtr::new(&waiter));
-                    ptr = state.value.as_mut() as *mut _;
-                    (Action::Keep, None)
-                }
-            }
-            None => (Action::Keep, None),
-        });
-
-        if ptr.is_null() {
-            return value;
-        }
-
-        WaiterPtr::wait(&waiter);
-
-        let value = Self::value_ptr_to_ref(ptr).clone();
-        self.unlock_by_ref(key);
         value
     }
 }
@@ -588,7 +484,7 @@ pub struct Entry<'a, K: Eq + Hash + Clone, V> {
 
 impl<K: Eq + Hash + Clone, V> Drop for Entry<'_, K, V> {
     fn drop(&mut self) {
-        self.map.unlock(self.key.clone());
+        self.map.unlock(&self.key);
     }
 }
 
@@ -620,7 +516,7 @@ impl<K: Eq + Hash + Clone, V> Drop for Entry<'_, K, V> {
 /// ```
 pub struct EntryByRef<'a, 'b, K: Eq + Hash + Clone, Q, V>
 where
-    K: Borrow<Q> + for<'c> From<&'c Q>,
+    K: Borrow<Q>,
     Q: Eq + Hash + ?Sized,
 {
     map: &'a LockMap<K, V>,
@@ -630,11 +526,11 @@ where
 
 impl<K: Eq + Hash + Clone, Q, V> Drop for EntryByRef<'_, '_, K, Q, V>
 where
-    K: Borrow<Q> + for<'c> From<&'c Q>,
+    K: Borrow<Q>,
     Q: Eq + Hash + ?Sized,
 {
     fn drop(&mut self) {
-        self.map.unlock_by_ref(self.key);
+        self.map.unlock(self.key);
     }
 }
 
@@ -783,7 +679,7 @@ mod tests {
                     let key = rand::random::<u32>() % 32;
                     let value = rand::random::<u32>() % 32;
                     if value < 16 {
-                        lock_map.remove(key);
+                        lock_map.remove(&key);
                     } else {
                         lock_map.set(key, value);
                     }
@@ -796,7 +692,7 @@ mod tests {
             std::thread::spawn(move || {
                 for _ in 0..N {
                     let key = rand::random::<u32>() % 32;
-                    let value = lock_map.get(key);
+                    let value = lock_map.get(&key);
                     if let Some(v) = value {
                         assert!(v >= 16)
                     }
@@ -839,7 +735,7 @@ mod tests {
                     let key = (rand::random::<u32>() % 32).to_string();
                     let value = rand::random::<u32>() % 32;
                     if value < 16 {
-                        lock_map.remove_by_ref(&key);
+                        lock_map.remove(&key);
                     } else {
                         lock_map.set_by_ref(&key, value);
                     }
@@ -852,7 +748,7 @@ mod tests {
             std::thread::spawn(move || {
                 for _ in 0..N {
                     let key = (rand::random::<u32>() % 32).to_string();
-                    let value = lock_map.get_by_ref(&key);
+                    let value = lock_map.get(&key);
                     if let Some(v) = value {
                         assert!(v >= 16)
                     }
