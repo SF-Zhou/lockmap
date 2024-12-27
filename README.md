@@ -19,7 +19,7 @@ let map = LockMap::<String, String>::new();
 map.set_by_ref("key", "value".into());
 
 // Get a value
-assert_eq!(map.get_by_ref("key"), Some("value".into()));
+assert_eq!(map.get("key"), Some("value".into()));
 
 // Use entry API for exclusive access
 {
@@ -28,5 +28,5 @@ assert_eq!(map.get_by_ref("key"), Some("value".into()));
 }
 
 // Remove a value
-map.remove_by_ref("key");
+map.remove("key");
 ```
