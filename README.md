@@ -28,5 +28,5 @@ assert_eq!(map.get("key"), Some("value".into()));
 }
 
 // Remove a value
-map.remove("key");
+assert_eq!(map.remove("key"), Some("new value".into()));
 ```
