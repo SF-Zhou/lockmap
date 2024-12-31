@@ -18,13 +18,17 @@
 //!
 //! // Basic operations
 //! map.set("key1".into(), 42);
-//! assert_eq!(map.get("key1".into()), Some(42));
+//! assert_eq!(map.get("key1"), Some(42));
 //!
 //! // Entry API for exclusive access
 //! {
 //!     let entry = map.entry("key2".into());
 //!     entry.value.replace(123);
 //! }
+//!
+//! // Remove a value
+//! assert_eq!(map.remove("key1"), Some(42));
+//! assert_eq!(map.get("key1"), None);
 //! ```
 #[doc = include_str!("../README.md")]
 mod lockmap;

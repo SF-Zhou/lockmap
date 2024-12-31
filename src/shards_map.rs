@@ -30,7 +30,7 @@ pub struct ShardMap<K, V> {
 
 impl<K, V> ShardMap<K, V>
 where
-    K: Eq + Hash + Clone,
+    K: Eq + Hash,
 {
     /// Creates a new `ShardMap` with the specified initial capacity.
     ///
@@ -152,7 +152,7 @@ pub struct ShardsMap<K, V> {
 
 impl<K, V> ShardsMap<K, V>
 where
-    K: Eq + Hash + Clone,
+    K: Eq + Hash,
 {
     /// Creates a new `ShardsMap` with the specified capacity and number of shards.
     ///
