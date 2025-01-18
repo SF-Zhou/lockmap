@@ -16,15 +16,15 @@ use lockmap::LockMap;
 let map = LockMap::<String, String>::new();
 
 // Set a value
-map.set_by_ref("key", "value".into());
+map.insert_by_ref("key", "value".into());
 
 // Get a value
 assert_eq!(map.get("key"), Some("value".into()));
 
 // Use entry API for exclusive access
 {
-    let entry = map.entry_by_ref("key");
-    *entry.value = Some("new value".into());
+    let mut entry = map.entry_by_ref("key");
+    *entry.get_mut() = Some("new value".into());
 }
 
 // Remove a value

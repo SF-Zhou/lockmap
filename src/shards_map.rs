@@ -16,7 +16,7 @@ pub enum UpdateAction<V> {
     /// Keep the current value unchanged.
     Keep,
     /// Update the value with the provided new value.
-    Update(V),
+    Replace(V),
 }
 
 /// A thread-safe hashmap shard.
@@ -83,7 +83,7 @@ where
                 let (action, ret) = func(Some(value));
                 match action {
                     UpdateAction::Keep => {}
-                    UpdateAction::Update(v) => {
+                    UpdateAction::Replace(v) => {
                         *value = v;
                     }
                 }
@@ -93,7 +93,7 @@ where
                 let (action, ret) = func(None);
                 match action {
                     UpdateAction::Keep => {}
-                    UpdateAction::Update(value) => {
+                    UpdateAction::Replace(value) => {
                         map.insert(key, value);
                     }
                 }
@@ -124,7 +124,7 @@ where
                 let (action, ret) = func(Some(value));
                 match action {
                     UpdateAction::Keep => {}
-                    UpdateAction::Update(v) => {
+                    UpdateAction::Replace(v) => {
                         *value = v;
                     }
                 }
@@ -134,7 +134,7 @@ where
                 let (action, ret) = func(None);
                 match action {
                     UpdateAction::Keep => {}
-                    UpdateAction::Update(value) => {
+                    UpdateAction::Replace(value) => {
                         map.insert(key.into(), value);
                     }
                 }
@@ -255,7 +255,7 @@ mod tests {
         let shards_map = ShardsMap::<u32, u32>::with_capacity_and_shard_amount(256, 16);
         shards_map.update(1, |v| {
             assert_eq!(v, None);
-            (UpdateAction::Update(1), ())
+            (UpdateAction::Replace(1), ())
         });
         shards_map.update(2, |v| {
             assert_eq!(v, None);
@@ -267,7 +267,7 @@ mod tests {
         });
         shards_map.update(1, |v| {
             assert_eq!(v.cloned(), Some(1));
-            (UpdateAction::Update(2), ())
+            (UpdateAction::Replace(2), ())
         });
         shards_map.update(1, |v| {
             assert_eq!(v.cloned(), Some(2));
@@ -288,11 +288,11 @@ mod tests {
         let shards_map = ShardsMap::<String, String>::with_capacity_and_shard_amount(256, 16);
         shards_map.update_by_ref("hello", |v| {
             assert_eq!(v, None);
-            (UpdateAction::Update("world".to_string()), ())
+            (UpdateAction::Replace("world".to_string()), ())
         });
         shards_map.update_by_ref("hello", |v| {
             assert_eq!(v.unwrap(), "world");
-            (UpdateAction::Update("lockmap".to_string()), ())
+            (UpdateAction::Replace("lockmap".to_string()), ())
         });
         shards_map.simple_update("hello", |v| {
             assert_eq!(v, Some(&mut "lockmap".to_string()));
@@ -304,7 +304,7 @@ mod tests {
         });
         shards_map.update_by_ref("hello", |v| {
             assert_eq!(v, None);
-            (UpdateAction::Update("lockmap".to_string()), ())
+            (UpdateAction::Replace("lockmap".to_string()), ())
         });
         shards_map.simple_update("hello", |v| {
             assert_eq!(v.unwrap(), "lockmap");
@@ -337,7 +337,7 @@ mod tests {
         const N: usize = 1 << 12;
         const M: usize = 8;
 
-        lock_map.update(1, |_| (UpdateAction::Update(0), ()));
+        lock_map.update(1, |_| (UpdateAction::Replace(0), ()));
 
         let threads = (0..M)
             .map(|_| {
@@ -360,7 +360,7 @@ mod tests {
         threads.into_iter().for_each(|t| t.join().unwrap());
 
         assert_eq!(
-            lock_map.update(1, |v| (UpdateAction::Update(0), *v.unwrap())),
+            lock_map.update(1, |v| (UpdateAction::Replace(0), *v.unwrap())),
             N * M
         );
     }
