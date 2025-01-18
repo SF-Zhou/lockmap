@@ -17,24 +17,24 @@
 //! let map = LockMap::<String, u32>::new();
 //!
 //! // Basic operations
-//! map.set("key1".into(), 42);
+//! map.insert("key1".into(), 42);
 //! assert_eq!(map.get("key1"), Some(42));
 //!
 //! // Entry API for exclusive access
 //! {
-//!     let entry = map.entry("key2".into());
-//!     entry.value.replace(123);
+//!     let mut entry = map.entry("key2".into());
+//!     entry.get_mut().replace(123);
 //! }
 //!
 //! // Remove a value
 //! assert_eq!(map.remove("key1"), Some(42));
 //! assert_eq!(map.get("key1"), None);
 //! ```
+mod futex;
 #[doc = include_str!("../README.md")]
 mod lockmap;
 mod shards_map;
-mod waiter;
 
+use futex::*;
 pub use lockmap::*;
 use shards_map::*;
-use waiter::*;
