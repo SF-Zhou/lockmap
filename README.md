@@ -24,7 +24,8 @@ assert_eq!(map.get("key"), Some("value".into()));
 // Use entry API for exclusive access
 {
     let mut entry = map.entry_by_ref("key");
-    *entry.get_mut() = Some("new value".into());
+    assert_eq!(entry.get().as_deref(), Some("value"));
+    entry.insert("new value".to_string());
 }
 
 // Remove a value
