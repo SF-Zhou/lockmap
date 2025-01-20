@@ -89,7 +89,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     /// let map = LockMap::<String, u32>::new();
     /// {
     ///     let mut entry = map.entry("key".to_string());
-    ///     entry.get_mut().replace(42);
+    ///     entry.insert(42);
     ///     // let _ = map.get("key".to_string()); // DEADLOCK!
     ///     // map.insert("key".to_string(), 21); // DEADLOCK!
     ///     // map.remove("key".to_string()); // DEADLOCK!
@@ -133,7 +133,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     /// let map = LockMap::<String, u32>::new();
     /// {
     ///     let mut entry = map.entry_by_ref("key");
-    ///     entry.get_mut().replace(42);
+    ///     entry.insert(42);
     ///     // let _ = map.get("key"); // DEADLOCK!
     ///     // map.insert_by_ref("key", 21); // DEADLOCK!
     ///     // map.remove("key"); // DEADLOCK!
@@ -451,7 +451,7 @@ impl<K, V> std::fmt::Debug for LockMap<K, V> {
 ///     let mut entry = map.entry("key");
 ///
 ///     // Modify the value
-///     entry.get_mut().replace(42);
+///     entry.insert(42);
 ///
 ///     // EntryByVal is automatically unlocked when dropped
 /// }
@@ -477,6 +477,10 @@ impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
 
     pub fn insert(&mut self, value: V) -> Option<V> {
         self.state.value.replace(value)
+    }
+
+    pub fn remove(&mut self) -> Option<V> {
+        self.state.value.take()
     }
 }
 
@@ -517,7 +521,7 @@ impl<K: Eq + Hash, V> Drop for EntryByVal<'_, K, V> {
 ///     let mut entry = map.entry_by_ref("key");
 ///
 ///     // Modify the value
-///     entry.get_mut().replace(42);
+///     entry.insert(42);
 ///
 ///     // EntryByRef is automatically unlocked when dropped
 /// }
@@ -543,6 +547,10 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q
 
     pub fn insert(&mut self, value: V) -> Option<V> {
         self.state.value.replace(value)
+    }
+
+    pub fn remove(&mut self) -> Option<V> {
+        self.state.value.take()
     }
 }
 
@@ -588,7 +596,7 @@ mod tests {
         {
             let mut entry = map.entry(1);
             assert_eq!(entry.get_mut().unwrap(), 2);
-            entry.get_mut().take();
+            assert_eq!(entry.remove(), Some(2));
         }
         {
             let mut entry = map.entry(1);
@@ -597,10 +605,31 @@ mod tests {
         let map = LockMap::<u32, u32>::default();
         {
             let mut entry = map.entry(1);
-            entry.get_mut().replace(2);
+            assert_eq!(entry.insert(2), None);
         }
         assert_eq!(map.remove(&1), Some(2));
         assert_eq!(map.remove(&1), None);
+    }
+
+    #[test]
+    fn test_lockmap_lock_by_ref() {
+        let map = LockMap::<String, u32>::new();
+        println!("{:?}", map);
+        {
+            let mut entry = map.entry_by_ref("1");
+            assert_eq!(entry.key(), "1");
+            assert_eq!(entry.insert(2), None);
+            println!("{:?}", entry);
+        }
+        {
+            let mut entry = map.entry_by_ref("1");
+            assert_eq!(entry.get_mut().unwrap(), 2);
+            assert_eq!(entry.remove(), Some(2));
+        }
+        {
+            let mut entry = map.entry_by_ref("1");
+            assert!(entry.get_mut().is_none());
+        }
     }
 
     #[test]
