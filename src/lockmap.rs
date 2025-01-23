@@ -76,6 +76,16 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         }
     }
 
+    /// Returns the number of elements in the map.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Returns `true` if the map contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     /// Gets exclusive access to an entry in the map.
     ///
     /// The returned `EntryByVal` provides exclusive access to the key and its associated value
@@ -467,7 +477,7 @@ impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
         &self.key
     }
 
-    pub fn get(&mut self) -> &Option<V> {
+    pub fn get(&self) -> &Option<V> {
         &self.state.value
     }
 
@@ -537,7 +547,7 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q
         self.key
     }
 
-    pub fn get(&mut self) -> &Option<V> {
+    pub fn get(&self) -> &Option<V> {
         &self.state.value
     }
 
@@ -586,18 +596,23 @@ mod tests {
     #[test]
     fn test_lockmap_lock() {
         let map = LockMap::<u32, u32>::new();
+        assert!(map.is_empty());
         println!("{:?}", map);
         {
             let mut entry = map.entry(1);
             assert_eq!(*entry.key(), 1);
             assert_eq!(entry.insert(2), None);
             println!("{:?}", entry);
+            assert!(!map.is_empty());
+            assert_eq!(map.len(), 1);
         }
         {
             let mut entry = map.entry(1);
             assert_eq!(entry.get_mut().unwrap(), 2);
             assert_eq!(entry.remove(), Some(2));
         }
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
         {
             let mut entry = map.entry(1);
             assert!(entry.get_mut().is_none());
@@ -607,8 +622,14 @@ mod tests {
             let mut entry = map.entry(1);
             assert_eq!(entry.insert(2), None);
         }
+        assert!(!map.is_empty());
+        assert_eq!(map.len(), 1);
         assert_eq!(map.remove(&1), Some(2));
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
         assert_eq!(map.remove(&1), None);
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
     }
 
     #[test]

@@ -47,6 +47,14 @@ where
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.lock().unwrap().is_empty()
+    }
+
     pub fn simple_update<Q, F, R>(&self, key: &Q, func: F) -> R
     where
         K: Borrow<Q>,
@@ -173,6 +181,14 @@ where
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.shards.iter().all(|s| s.is_empty())
+    }
+
     /// Updates the value associated with the given key using the provided function.
     ///
     /// # Arguments
@@ -253,10 +269,14 @@ mod tests {
     #[test]
     fn test_shards_map() {
         let shards_map = ShardsMap::<u32, u32>::with_capacity_and_shard_amount(256, 16);
+        assert!(shards_map.is_empty());
+        assert_eq!(shards_map.len(), 0);
         shards_map.update(1, |v| {
             assert_eq!(v, None);
             (UpdateAction::Replace(1), ())
         });
+        assert!(!shards_map.is_empty());
+        assert_eq!(shards_map.len(), 1);
         shards_map.update(2, |v| {
             assert_eq!(v, None);
             (UpdateAction::Keep, ())
@@ -265,6 +285,8 @@ mod tests {
             assert_eq!(v, None);
             (SimpleAction::Remove, ())
         });
+        assert!(!shards_map.is_empty());
+        assert_eq!(shards_map.len(), 1);
         shards_map.update(1, |v| {
             assert_eq!(v.cloned(), Some(1));
             (UpdateAction::Replace(2), ())
@@ -277,10 +299,14 @@ mod tests {
             assert_eq!(v.cloned(), Some(2));
             (SimpleAction::Remove, ())
         });
+        assert!(shards_map.is_empty());
+        assert_eq!(shards_map.len(), 0);
         shards_map.simple_update(&1, |v| {
             assert_eq!(v, None);
             (SimpleAction::Remove, ())
         });
+        assert!(shards_map.is_empty());
+        assert_eq!(shards_map.len(), 0);
     }
 
     #[test]
