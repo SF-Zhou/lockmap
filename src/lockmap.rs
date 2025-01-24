@@ -886,4 +886,50 @@ mod tests {
         set_thread.join().unwrap();
         get_thread.join().unwrap();
     }
+
+    #[test]
+    fn test_lockmap_heavy_contention() {
+        let lock_map = Arc::new(LockMap::<u32, u32>::new());
+        const THREADS: usize = 16;
+        const OPS_PER_THREAD: usize = 10000;
+        const HOT_KEYS: u32 = 5;
+
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let lock_map = lock_map.clone();
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..OPS_PER_THREAD {
+                        let key = rand::random::<u32>() % HOT_KEYS;
+                        let mut entry = lock_map.entry(key);
+
+                        // Simulate some work
+                        std::thread::sleep(std::time::Duration::from_nanos(10));
+
+                        match entry.get_mut() {
+                            Some(value) => {
+                                *value = value.wrapping_add(1);
+                                counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                            None => {
+                                entry.insert(1);
+                                counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            THREADS as u32 * OPS_PER_THREAD as u32
+        );
+    }
 }

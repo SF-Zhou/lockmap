@@ -132,4 +132,49 @@ mod tests {
             task.join().unwrap();
         }
     }
+
+    #[test]
+    fn test_concurrent() {
+        let lock = Arc::new(Mutex::new());
+        let counter = Arc::new(AtomicU32::new(0));
+        const THREAD_COUNT: usize = 4;
+        const ITERATIONS: usize = 10000;
+
+        let mut handles = vec![];
+
+        // Spawn multiple threads that increment and decrement a shared counter
+        for _ in 0..THREAD_COUNT {
+            let lock = Arc::clone(&lock);
+            let counter = Arc::clone(&counter);
+
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ITERATIONS {
+                    // Lock and modify shared state
+                    lock.lock();
+                    let value = counter.load(Relaxed);
+                    std::thread::yield_now(); // Force a context switch to increase contention
+                    counter.store(value + 1, Relaxed);
+                    lock.unlock();
+
+                    // Do some work without the lock
+                    std::thread::yield_now();
+
+                    // Lock and modify shared state again
+                    lock.lock();
+                    let value = counter.load(Relaxed);
+                    std::thread::yield_now(); // Force a context switch to increase contention
+                    counter.store(value - 1, Relaxed);
+                    lock.unlock();
+                }
+            }));
+        }
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify the final counter value is 0
+        assert_eq!(counter.load(Relaxed), 0);
+    }
 }
