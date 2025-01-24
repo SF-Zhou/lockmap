@@ -473,22 +473,27 @@ pub struct EntryByVal<'a, K: Eq + Hash, V> {
 }
 
 impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
+    /// Returns a reference to the entry's key.
     pub fn key(&self) -> &K {
         &self.key
     }
 
+    /// Returns a reference to the entry's value.
     pub fn get(&self) -> &Option<V> {
         &self.state.value
     }
 
+    /// Returns a mutable reference to the entry's value.
     pub fn get_mut(&mut self) -> &mut Option<V> {
         &mut self.state.value
     }
 
+    /// Sets the value of the entry, returning the old value if it existed.
     pub fn insert(&mut self, value: V) -> Option<V> {
         self.state.value.replace(value)
     }
 
+    /// Removes the value from the entry, returning it if it existed.
     pub fn remove(&mut self) -> Option<V> {
         self.state.value.take()
     }
@@ -543,22 +548,27 @@ pub struct EntryByRef<'a, 'b, K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V
 }
 
 impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q, V> {
+    /// Returns a reference to the entry's key.
     pub fn key(&self) -> &Q {
         self.key
     }
 
+    /// Returns a reference to the entry's value.
     pub fn get(&self) -> &Option<V> {
         &self.state.value
     }
 
+    /// Returns a mutable reference to the entry's value.
     pub fn get_mut(&mut self) -> &mut Option<V> {
         &mut self.state.value
     }
 
+    /// Sets the value of the entry, returning the old value if it existed.
     pub fn insert(&mut self, value: V) -> Option<V> {
         self.state.value.replace(value)
     }
 
+    /// Removes the value from the entry, returning it if it existed.
     pub fn remove(&mut self) -> Option<V> {
         self.state.value.take()
     }
