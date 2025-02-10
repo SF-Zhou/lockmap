@@ -223,7 +223,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
             return value;
         }
 
-        self.guard_by_ref(ptr, key).state.value.clone()
+        self.guard_by_ref(ptr, key).get().clone()
     }
 
     /// Sets a value in the map.
@@ -278,8 +278,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
             return value;
         }
 
-        let mut entry = self.guard_by_val(ptr, key.clone());
-        std::mem::replace(entry.get_mut(), value)
+        self.guard_by_val(ptr, key.clone()).swap(value)
     }
 
     /// Sets a value in the map.
@@ -335,8 +334,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
             return value;
         }
 
-        let mut entry = self.guard_by_ref(ptr, key);
-        std::mem::replace(entry.get_mut(), value)
+        self.guard_by_ref(ptr, key).swap(value)
     }
 
     /// Removes a key from the map.
@@ -386,7 +384,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
             return value;
         }
 
-        self.guard_by_ref(ptr, key).state.value.take()
+        self.guard_by_ref(ptr, key).remove()
     }
 
     fn unlock<Q>(&self, key: &Q)
@@ -473,22 +471,33 @@ pub struct EntryByVal<'a, K: Eq + Hash, V> {
 }
 
 impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
+    /// Returns a reference to the entry's key.
     pub fn key(&self) -> &K {
         &self.key
     }
 
+    /// Returns a reference to the entry's value.
     pub fn get(&self) -> &Option<V> {
         &self.state.value
     }
 
+    /// Returns a mutable reference to the entry's value.
     pub fn get_mut(&mut self) -> &mut Option<V> {
         &mut self.state.value
     }
 
+    /// Sets the value of the entry, returning the old value if it existed.
     pub fn insert(&mut self, value: V) -> Option<V> {
         self.state.value.replace(value)
     }
 
+    /// Swaps the value of the entry, returning the old value if it existed.
+    pub fn swap(&mut self, mut value: Option<V>) -> Option<V> {
+        std::mem::swap(&mut self.state.value, &mut value);
+        value
+    }
+
+    /// Removes the value from the entry, returning it if it existed.
     pub fn remove(&mut self) -> Option<V> {
         self.state.value.take()
     }
@@ -543,22 +552,33 @@ pub struct EntryByRef<'a, 'b, K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V
 }
 
 impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q, V> {
+    /// Returns a reference to the entry's key.
     pub fn key(&self) -> &Q {
         self.key
     }
 
+    /// Returns a reference to the entry's value.
     pub fn get(&self) -> &Option<V> {
         &self.state.value
     }
 
+    /// Returns a mutable reference to the entry's value.
     pub fn get_mut(&mut self) -> &mut Option<V> {
         &mut self.state.value
     }
 
+    /// Sets the value of the entry, returning the old value if it existed.
     pub fn insert(&mut self, value: V) -> Option<V> {
         self.state.value.replace(value)
     }
 
+    /// Swaps the value of the entry, returning the old value if it existed.
+    pub fn swap(&mut self, mut value: Option<V>) -> Option<V> {
+        std::mem::swap(&mut self.state.value, &mut value);
+        value
+    }
+
+    /// Removes the value from the entry, returning it if it existed.
     pub fn remove(&mut self) -> Option<V> {
         self.state.value.take()
     }
@@ -875,5 +895,51 @@ mod tests {
         entry_thread.join().unwrap();
         set_thread.join().unwrap();
         get_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_lockmap_heavy_contention() {
+        let lock_map = Arc::new(LockMap::<u32, u32>::new());
+        const THREADS: usize = 16;
+        const OPS_PER_THREAD: usize = 10000;
+        const HOT_KEYS: u32 = 5;
+
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let lock_map = lock_map.clone();
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..OPS_PER_THREAD {
+                        let key = rand::random::<u32>() % HOT_KEYS;
+                        let mut entry = lock_map.entry(key);
+
+                        // Simulate some work
+                        std::thread::sleep(std::time::Duration::from_nanos(10));
+
+                        match entry.get_mut() {
+                            Some(value) => {
+                                *value = value.wrapping_add(1);
+                                counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                            None => {
+                                entry.insert(1);
+                                counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            THREADS as u32 * OPS_PER_THREAD as u32
+        );
     }
 }
