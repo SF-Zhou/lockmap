@@ -223,7 +223,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
             return value;
         }
 
-        self.guard_by_ref(ptr, key).state.value.clone()
+        self.guard_by_ref(ptr, key).get().clone()
     }
 
     /// Sets a value in the map.
@@ -278,8 +278,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
             return value;
         }
 
-        let mut entry = self.guard_by_val(ptr, key.clone());
-        std::mem::replace(entry.get_mut(), value)
+        self.guard_by_val(ptr, key.clone()).swap(value)
     }
 
     /// Sets a value in the map.
@@ -335,8 +334,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
             return value;
         }
 
-        let mut entry = self.guard_by_ref(ptr, key);
-        std::mem::replace(entry.get_mut(), value)
+        self.guard_by_ref(ptr, key).swap(value)
     }
 
     /// Removes a key from the map.
@@ -386,7 +384,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
             return value;
         }
 
-        self.guard_by_ref(ptr, key).state.value.take()
+        self.guard_by_ref(ptr, key).remove()
     }
 
     fn unlock<Q>(&self, key: &Q)
@@ -493,6 +491,12 @@ impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
         self.state.value.replace(value)
     }
 
+    /// Swaps the value of the entry, returning the old value if it existed.
+    pub fn swap(&mut self, mut value: Option<V>) -> Option<V> {
+        std::mem::swap(&mut self.state.value, &mut value);
+        value
+    }
+
     /// Removes the value from the entry, returning it if it existed.
     pub fn remove(&mut self) -> Option<V> {
         self.state.value.take()
@@ -566,6 +570,12 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q
     /// Sets the value of the entry, returning the old value if it existed.
     pub fn insert(&mut self, value: V) -> Option<V> {
         self.state.value.replace(value)
+    }
+
+    /// Swaps the value of the entry, returning the old value if it existed.
+    pub fn swap(&mut self, mut value: Option<V>) -> Option<V> {
+        std::mem::swap(&mut self.state.value, &mut value);
+        value
     }
 
     /// Removes the value from the entry, returning it if it existed.
