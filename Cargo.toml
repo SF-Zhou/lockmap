@@ -1,6 +1,6 @@
 [package]
 name = "lockmap"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 
 authors = ["SF-Zhou <sfzhou.scut@gmail.com>"]

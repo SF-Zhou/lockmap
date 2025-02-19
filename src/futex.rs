@@ -1,4 +1,5 @@
 // Modified from https://github.com/rust-lang/rust/blob/master/library/std/src/sys/sync/mutex/futex.rs
+// Copyright (c) The Rust Project Contributors
 use std::sync::atomic::{
     AtomicU32,
     Ordering::{Acquire, Relaxed, Release},
