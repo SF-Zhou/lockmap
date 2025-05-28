@@ -1,6 +1,7 @@
+use foldhash::fast::{FixedState, RandomState};
 use std::borrow::Borrow;
-use std::collections::{hash_map::DefaultHasher, HashMap};
-use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
+use std::hash::{BuildHasher, Hash};
 use std::sync::Mutex;
 
 /// Represents the action to be taken on a value in the `ShardMap`.
@@ -25,7 +26,7 @@ pub enum UpdateAction<V> {
 #[derive(Debug)]
 pub struct ShardMap<K, V> {
     /// The underlying hashmap protected by a `Mutex`.
-    map: Mutex<HashMap<K, V>>,
+    map: Mutex<HashMap<K, V, RandomState>>,
 }
 
 impl<K, V> ShardMap<K, V>
@@ -43,7 +44,10 @@ where
     /// A new `ShardMap` instance.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            map: Mutex::new(HashMap::with_capacity(capacity)),
+            map: Mutex::new(HashMap::with_capacity_and_hasher(
+                capacity,
+                RandomState::default(),
+            )),
         }
     }
 
@@ -250,9 +254,7 @@ where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let mut s = DefaultHasher::new();
-        key.hash(&mut s);
-        let idx = s.finish() as usize % self.shards.len();
+        let idx = FixedState::default().hash_one(key) as usize % self.shards.len();
         &self.shards[idx]
     }
 }

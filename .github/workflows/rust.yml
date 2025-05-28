@@ -18,11 +18,20 @@ jobs:
 
     - name: Run tests
       run: |
-        cargo install cargo-llvm-cov
-        cargo llvm-cov --release --lcov --output-path lcov.info
+        cargo install cargo-llvm-cov cargo-nextest
+        cargo llvm-cov nextest
+        cargo llvm-cov report --cobertura --output-path target/llvm-cov-target/cobertura.xml
 
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v4
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         slug: SF-Zhou/lockmap
+        files: target/llvm-cov-target/cobertura.xml
+
+    - name: Upload test results to Codecov
+      uses: codecov/test-results-action@v1
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        slug: SF-Zhou/lockmap
+        files: target/nextest/default/junit.xml
