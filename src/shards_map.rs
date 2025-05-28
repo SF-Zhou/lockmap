@@ -1,7 +1,7 @@
-use foldhash::fast::RandomState;
+use foldhash::fast::{FixedState, RandomState};
 use std::borrow::Borrow;
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 use std::sync::Mutex;
 
 /// Represents the action to be taken on a value in the `ShardMap`.
@@ -254,9 +254,7 @@ where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let mut s = RandomState::default().build_hasher();
-        key.hash(&mut s);
-        let idx = s.finish() as usize % self.shards.len();
+        let idx = FixedState::default().hash_one(key) as usize % self.shards.len();
         &self.shards[idx]
     }
 }
