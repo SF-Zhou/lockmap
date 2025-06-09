@@ -337,6 +337,55 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         self.guard_by_ref(ptr, key).swap(value)
     }
 
+    /// Checks if the map contains a key.
+    ///
+    /// If other threads are currently accessing the key, this will wait
+    /// until exclusive access is available before checking.
+    ///
+    /// # Arguments
+    /// * `key` - The key to check
+    ///
+    /// # Returns
+    /// * `true` if the key exists
+    /// * `false` if the key doesn't exist
+    ///
+    /// **Locking behaviour:** Deadlock if called when holding the same entry.
+    ///
+    /// # Examples
+    /// ```
+    /// use lockmap::LockMap;
+    ///
+    /// let map = LockMap::new();
+    /// map.insert("key", 42);
+    /// assert!(map.contains_key("key"));
+    /// assert!(!map.contains_key("non_existent_key"));
+    /// ```
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        let mut ptr: *mut State<V> = std::ptr::null_mut();
+        let value = self.map.simple_update(key, |s| match s {
+            Some(state) => {
+                if state.refcnt == 0 {
+                    (SimpleAction::Keep, state.value.is_some())
+                } else {
+                    state.refcnt += 1;
+                    ptr = state.as_mut();
+                    (SimpleAction::Keep, false)
+                }
+            }
+            None => (SimpleAction::Keep, false),
+        });
+
+        if ptr.is_null() {
+            return value;
+        }
+
+        self.guard_by_ref(ptr, key).get().is_some()
+    }
+
     /// Removes a key from the map.
     ///
     /// If other threads are currently accessing the key, this will wait
@@ -644,8 +693,10 @@ mod tests {
         }
         assert!(!map.is_empty());
         assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&1));
         assert_eq!(map.remove(&1), Some(2));
         assert!(map.is_empty());
+        assert!(!map.contains_key(&1));
         assert_eq!(map.len(), 0);
         assert_eq!(map.remove(&1), None);
         assert!(map.is_empty());
@@ -928,6 +979,8 @@ mod tests {
                                 counter.fetch_add(1, Ordering::Relaxed);
                             }
                         }
+                        drop(entry);
+                        assert!(lock_map.contains_key(&key), "Key {} should exist", key);
                     }
                 })
             })
