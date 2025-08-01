@@ -1,5 +1,6 @@
 use crate::{Mutex, ShardsMap, SimpleAction, UpdateAction};
 use std::borrow::Borrow;
+use std::collections::BTreeSet;
 use std::hash::Hash;
 use std::sync::OnceLock;
 
@@ -127,7 +128,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
             }
         });
 
-        self.guard_by_val(ptr, key.clone())
+        self.guard_by_val(ptr, key)
     }
 
     /// Gets exclusive access to an entry in the map.
@@ -278,7 +279,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
             return value;
         }
 
-        self.guard_by_val(ptr, key.clone()).swap(value)
+        self.guard_by_val(ptr, key).swap(value)
     }
 
     /// Sets a value in the map.
@@ -434,6 +435,71 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         }
 
         self.guard_by_ref(ptr, key).remove()
+    }
+
+    /// Acquires exclusive locks for a batch of keys in a deadlock-safe manner.
+    ///
+    /// This function is designed to prevent deadlocks that can occur when multiple threads
+    /// try to acquire locks on the same set of keys in different orders. It achieves this
+    /// by taking a `BTreeSet` of keys, which ensures the keys are processed and locked
+    /// in a consistent, sorted order across all threads.
+    ///
+    /// The function iterates through the sorted keys, acquiring an exclusive lock for each
+    /// key and its associated value. The returned `Vec` contains RAII guards, which
+    /// automatically release the locks when they are dropped.
+    ///
+    /// # Arguments
+    ///
+    /// * `keys` - The `BTreeSet` of keys to lock. The use of `BTreeSet` is crucial as it
+    ///   enforces a global, canonical locking order, thus preventing deadlocks.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<EntryByVal<K, V>>` containing the RAII guards for each locked key.
+    ///
+    /// **Locking behaviour:** Deadlock if called when holding the same entry.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use lockmap::LockMap;
+    /// use std::collections::BTreeSet;
+    ///
+    /// let map = LockMap::<u32, u32>::new();
+    /// map.insert(1, 100);
+    /// map.insert(2, 200);
+    /// map.insert(3, 300);
+    ///
+    /// // Create a set of keys to lock. Note that the order in the set doesn't matter
+    /// // since BTreeSet will sort them.
+    /// let mut keys = BTreeSet::new();
+    /// keys.insert(3);
+    /// keys.insert(1);
+    /// keys.insert(2);
+    ///
+    /// // Acquire locks for all keys in a deadlock-safe manner
+    /// let mut locked_entries = map.batch_lock::<std::collections::HashMap<_, _>>(keys);
+    ///
+    /// // The locks are held as long as `locked_entries` is in scope
+    /// locked_entries.get_mut(&1).and_then(|entry| entry.insert(101));
+    /// locked_entries.get_mut(&2).and_then(|entry| entry.insert(201));
+    /// locked_entries.get_mut(&3).and_then(|entry| entry.insert(301));
+    ///
+    /// // When `locked_entries` is dropped, all locks are released
+    /// drop(locked_entries);
+    ///
+    /// assert_eq!(map.get(&1), Some(101));
+    /// assert_eq!(map.get(&2), Some(201));
+    /// assert_eq!(map.get(&3), Some(301));
+    /// ```
+    pub fn batch_lock<'a, M>(&'a self, keys: BTreeSet<K>) -> M
+    where
+        K: Clone,
+        M: FromIterator<(K, EntryByVal<'a, K, V>)>,
+    {
+        keys.into_iter()
+            .map(|key| (key.clone(), self.entry(key)))
+            .collect()
     }
 
     fn unlock<Q>(&self, key: &Q)
@@ -657,9 +723,12 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> Drop for EntryByRef<'_,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicU32, Ordering},
+            Arc,
+        },
     };
 
     #[test]
@@ -829,6 +898,38 @@ mod tests {
                         entry.get_mut().replace(1);
                         total.fetch_add(1, Ordering::AcqRel);
                         entry.get_mut().take();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+
+        assert_eq!(total.load(Ordering::Acquire) as usize, N * M);
+    }
+
+    #[test]
+    fn test_lockmap_random_batch_lock() {
+        let lock_map = Arc::new(LockMap::<u32, u32>::with_capacity_and_shard_amount(256, 16));
+        let total = Arc::new(AtomicU32::default());
+        const N: usize = 1 << 16;
+        const M: usize = 8;
+
+        let threads = (0..M)
+            .map(|_| {
+                let lock_map = lock_map.clone();
+                let total = total.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..N {
+                        let keys = (0..3).map(|_| rand::random::<u32>() % 32).collect();
+                        let mut entries: HashMap<_, _> = lock_map.batch_lock(keys);
+                        for (_key, entry) in &mut entries {
+                            assert!(entry.get().is_none());
+                            entry.insert(1);
+                        }
+                        total.fetch_add(1, Ordering::AcqRel);
+                        for (_key, entry) in &mut entries {
+                            entry.remove();
+                        }
                     }
                 })
             })

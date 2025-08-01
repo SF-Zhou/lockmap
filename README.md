@@ -31,8 +31,15 @@ assert_eq!(map.get("key"), Some("value".into()));
 
 // Remove a value
 assert_eq!(map.remove("key"), Some("new value".into()));
+
+// Batch lock.
+let mut keys = std::collections::BTreeSet::new();
+keys.insert("key1".to_string());
+keys.insert("key2".to_string());
+let mut locked_entries = map.batch_lock::<std::collections::HashMap<_, _>>(keys);
 ```
 
 
 ## License
+
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FSF-Zhou%2Flockmap.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2FSF-Zhou%2Flockmap?ref=badge_large)
