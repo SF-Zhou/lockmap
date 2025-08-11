@@ -520,7 +520,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         });
     }
 
-    fn guard_by_val(&self, ptr: *mut State<V>, key: K) -> EntryByVal<K, V> {
+    fn guard_by_val(&self, ptr: *mut State<V>, key: K) -> EntryByVal<'_, K, V> {
         let state = unsafe { &mut *ptr };
         state.mutex.lock();
         EntryByVal {
