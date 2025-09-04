@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash};
 use std::sync::Mutex;
 
-/// Represents the action to be taken on a value in the `ShardMap`.
+/// Represents the action to be taken on a value during a simple update operation.
+///
+/// This enum is used with `simple_update` methods that can only keep existing values
+/// unchanged or remove them entirely, without the ability to replace them with new values.
 pub enum SimpleAction {
     /// Keep the current value unchanged.
     Keep,
@@ -12,11 +15,14 @@ pub enum SimpleAction {
     Remove,
 }
 
-/// Represents the action to be taken on a value in the `ShardMap`.
+/// Represents the action to be taken on a value during an update operation.
+///
+/// This enum provides full control over what happens to a value during an update,
+/// allowing the value to be kept unchanged or replaced with a new value.
 pub enum UpdateAction<V> {
     /// Keep the current value unchanged.
     Keep,
-    /// Update the value with the provided new value.
+    /// Replace the current value with the provided new value.
     Replace(V),
 }
 
@@ -51,14 +57,38 @@ where
         }
     }
 
+    /// Returns the number of elements in the shard.
+    ///
+    /// # Returns
+    ///
+    /// The number of key-value pairs currently stored in this shard.
     pub fn len(&self) -> usize {
         self.map.lock().unwrap().len()
     }
 
+    /// Returns `true` if the shard contains no elements.
+    ///
+    /// # Returns
+    ///
+    /// `true` if this shard is empty, `false` otherwise.
     pub fn is_empty(&self) -> bool {
         self.map.lock().unwrap().is_empty()
     }
 
+    /// Updates the value associated with a key using a function that can only keep or remove.
+    ///
+    /// This is a simpler version of `update` that doesn't support replacing values,
+    /// only keeping them unchanged or removing them entirely.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to update
+    /// * `func` - A function that takes an `Option<&mut V>` and returns a tuple containing 
+    ///   the action to take (`SimpleAction::Keep` or `SimpleAction::Remove`) and a result value
+    ///
+    /// # Returns
+    ///
+    /// The result value returned by the provided function.
     pub fn simple_update<Q, F, R>(&self, key: &Q, func: F) -> R
     where
         K: Borrow<Q>,
@@ -114,16 +144,21 @@ where
         }
     }
 
-    /// Updates the value associated with the given key using the provided function.
+    /// Updates the value associated with a key using a reference to the key.
+    ///
+    /// This method is similar to `update` but takes a reference to the key instead of
+    /// owning it. If the key doesn't exist and needs to be inserted, it will be
+    /// created from the reference using the `From` trait.
     ///
     /// # Arguments
     ///
-    /// * `key` - The key to update.
-    /// * `func` - A function that takes an `Option<&mut V>` and returns a tuple containing the action to take and the result.
+    /// * `key` - A reference to the key to update
+    /// * `func` - A function that takes an `Option<&mut V>` and returns a tuple containing
+    ///   the action to take and a result value
     ///
     /// # Returns
     ///
-    /// The result returned by the provided function.
+    /// The result value returned by the provided function.
     pub fn update_by_ref<Q, F, R>(&self, key: &Q, func: F) -> R
     where
         K: Borrow<Q> + for<'c> From<&'c Q>,
@@ -185,10 +220,20 @@ where
         }
     }
 
+    /// Returns the total number of elements across all shards.
+    ///
+    /// # Returns
+    ///
+    /// The sum of elements in all shards.
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.len()).sum()
     }
 
+    /// Returns `true` if all shards contain no elements.
+    ///
+    /// # Returns
+    ///
+    /// `true` if all shards are empty, `false` otherwise.
     pub fn is_empty(&self) -> bool {
         self.shards.iter().all(|s| s.is_empty())
     }
@@ -248,6 +293,18 @@ where
         self.shard(key).update_by_ref(key, func)
     }
 
+    /// Gets the appropriate shard for a given key.
+    ///
+    /// Uses consistent hashing to distribute keys across shards, ensuring
+    /// that the same key always maps to the same shard.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to hash and map to a shard
+    ///
+    /// # Returns
+    ///
+    /// A reference to the `ShardMap` that should contain this key.
     #[inline(always)]
     fn shard<Q>(&self, key: &Q) -> &ShardMap<K, V>
     where

@@ -1,19 +1,59 @@
 // Modified from https://github.com/rust-lang/rust/blob/master/library/std/src/sys/sync/mutex/futex.rs
 // Copyright (c) The Rust Project Contributors
+
+//! Fast user-space mutex implementation using futex operations.
+//!
+//! This module provides a lightweight mutex implementation that optimizes for
+//! the common case of low contention while gracefully handling high contention
+//! scenarios through futex-based blocking.
+//!
+//! The implementation uses a three-state atomic variable to track lock state:
+//! - `UNLOCKED`: No thread holds the lock
+//! - `LOCKED`: One thread holds the lock, no others waiting  
+//! - `CONTENDED`: One thread holds the lock, others are waiting
+//!
+//! This design minimizes atomic operations in the fast path while ensuring
+//! fair wakeup behavior when contention occurs.
+
 use std::sync::atomic::{
     AtomicU32,
     Ordering::{Acquire, Relaxed, Release},
 };
 
+/// A fast user-space mutex implementation using futex operations.
+///
+/// This mutex is optimized for low contention scenarios by first attempting
+/// to acquire the lock using atomic operations before falling back to
+/// kernel-level futex operations when contention occurs.
+///
+/// # Performance Characteristics
+/// - Very fast in uncontended cases (single atomic operation)
+/// - Efficiently handles contended cases using futex syscalls
+/// - Minimal memory overhead (single 32-bit atomic)
+///
+/// # Safety
+/// This mutex does not provide poisoning support unlike `std::sync::Mutex`.
+/// If a thread panics while holding the lock, the lock may remain in a locked
+/// state permanently.
 pub struct Mutex {
     futex: AtomicU32,
 }
 
+/// Represents an unlocked mutex state.
 const UNLOCKED: u32 = 0;
-const LOCKED: u32 = 1; // locked, no other threads waiting
-const CONTENDED: u32 = 2; // locked, and other threads waiting (contended)
+
+/// Represents a locked mutex with no waiting threads.
+const LOCKED: u32 = 1;
+
+/// Represents a locked mutex with threads waiting for acquisition.
+const CONTENDED: u32 = 2;
 
 impl Mutex {
+    /// Creates a new mutex in the unlocked state.
+    ///
+    /// # Returns
+    ///
+    /// A new `Mutex` instance ready for use.
     #[inline]
     pub const fn new() -> Self {
         Self {
@@ -21,6 +61,12 @@ impl Mutex {
         }
     }
 
+    /// Attempts to acquire the lock without blocking.
+    ///
+    /// # Returns
+    ///
+    /// * `true` if the lock was successfully acquired
+    /// * `false` if the lock is currently held by another thread
     #[inline]
     pub fn try_lock(&self) -> bool {
         self.futex
@@ -28,6 +74,14 @@ impl Mutex {
             .is_ok()
     }
 
+    /// Acquires the lock, blocking the current thread until it becomes available.
+    ///
+    /// This function will not return until the lock has been acquired.
+    /// 
+    /// # Panics
+    ///
+    /// This function may panic if the current thread already holds the lock.
+    /// However, this is not guaranteed and should not be relied upon for correctness.
     #[inline]
     pub fn lock(&self) {
         if !self.try_lock() {
@@ -35,6 +89,11 @@ impl Mutex {
         }
     }
 
+    /// Handles lock acquisition when contention is detected.
+    ///
+    /// This is the slow path for lock acquisition, used when `try_lock` fails.
+    /// It first spins briefly to see if the lock becomes available quickly,
+    /// then falls back to using futex operations to block the thread.
     #[cold]
     fn lock_contended(&self) {
         // Spin first to speed things up if the lock is released quickly.
@@ -69,6 +128,14 @@ impl Mutex {
         }
     }
 
+    /// Performs a brief spin loop waiting for the lock to become available.
+    ///
+    /// This reduces the overhead of immediately falling back to futex operations
+    /// in cases where the lock is held only briefly.
+    ///
+    /// # Returns
+    ///
+    /// The current state of the futex after spinning.
     fn spin(&self) -> u32 {
         let mut spin = 100;
         loop {
@@ -87,6 +154,18 @@ impl Mutex {
         }
     }
 
+    /// Releases the lock.
+    ///
+    /// # Safety
+    ///
+    /// This function should only be called by the thread that currently holds the lock.
+    /// Calling this function when the lock is not held or from a different thread
+    /// may lead to undefined behavior.
+    ///
+    /// # Panics
+    ///
+    /// This function may panic if called when the lock is not held, but this
+    /// is not guaranteed and should not be relied upon for correctness.
     #[inline]
     pub fn unlock(&self) {
         if self.futex.swap(UNLOCKED, Release) == CONTENDED {
@@ -98,6 +177,10 @@ impl Mutex {
         }
     }
 
+    /// Wakes up one waiting thread.
+    ///
+    /// This is called when releasing a contended lock to notify waiting threads
+    /// that the lock is now available.
     #[cold]
     fn wake(&self) {
         atomic_wait::wake_one(&self.futex);

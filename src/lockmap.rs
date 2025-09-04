@@ -587,32 +587,64 @@ pub struct EntryByVal<'a, K: Eq + Hash, V> {
 
 impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
     /// Returns a reference to the entry's key.
+    ///
+    /// # Returns
+    ///
+    /// A reference to the key associated with this entry.
     pub fn key(&self) -> &K {
         &self.key
     }
 
     /// Returns a reference to the entry's value.
+    ///
+    /// # Returns
+    ///
+    /// A reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get(&self) -> &Option<V> {
         &self.state.value
     }
 
     /// Returns a mutable reference to the entry's value.
+    ///
+    /// # Returns
+    ///
+    /// A mutable reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get_mut(&mut self) -> &mut Option<V> {
         &mut self.state.value
     }
 
     /// Sets the value of the entry, returning the old value if it existed.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The new value to insert
+    ///
+    /// # Returns
+    ///
+    /// The previous value if the entry was occupied, or `None` if it was vacant.
     pub fn insert(&mut self, value: V) -> Option<V> {
         self.state.value.replace(value)
     }
 
-    /// Swaps the value of the entry, returning the old value if it existed.
+    /// Swaps the value of the entry with the provided value.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The new value to swap in (wrapped in `Option`)
+    ///
+    /// # Returns
+    ///
+    /// The previous value of the entry.
     pub fn swap(&mut self, mut value: Option<V>) -> Option<V> {
         std::mem::swap(&mut self.state.value, &mut value);
         value
     }
 
     /// Removes the value from the entry, returning it if it existed.
+    ///
+    /// # Returns
+    ///
+    /// The value that was stored in the entry, or `None` if the entry was vacant.
     pub fn remove(&mut self) -> Option<V> {
         self.state.value.take()
     }
@@ -668,32 +700,64 @@ pub struct EntryByRef<'a, 'b, K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V
 
 impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q, V> {
     /// Returns a reference to the entry's key.
+    ///
+    /// # Returns
+    ///
+    /// A reference to the key associated with this entry.
     pub fn key(&self) -> &Q {
         self.key
     }
 
     /// Returns a reference to the entry's value.
+    ///
+    /// # Returns
+    ///
+    /// A reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get(&self) -> &Option<V> {
         &self.state.value
     }
 
     /// Returns a mutable reference to the entry's value.
+    ///
+    /// # Returns
+    ///
+    /// A mutable reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get_mut(&mut self) -> &mut Option<V> {
         &mut self.state.value
     }
 
     /// Sets the value of the entry, returning the old value if it existed.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The new value to insert
+    ///
+    /// # Returns
+    ///
+    /// The previous value if the entry was occupied, or `None` if it was vacant.
     pub fn insert(&mut self, value: V) -> Option<V> {
         self.state.value.replace(value)
     }
 
-    /// Swaps the value of the entry, returning the old value if it existed.
+    /// Swaps the value of the entry with the provided value.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The new value to swap in (wrapped in `Option`)
+    ///
+    /// # Returns
+    ///
+    /// The previous value of the entry.
     pub fn swap(&mut self, mut value: Option<V>) -> Option<V> {
         std::mem::swap(&mut self.state.value, &mut value);
         value
     }
 
     /// Removes the value from the entry, returning it if it existed.
+    ///
+    /// # Returns
+    ///
+    /// The value that was stored in the entry, or `None` if the entry was vacant.
     pub fn remove(&mut self) -> Option<V> {
         self.state.value.take()
     }
