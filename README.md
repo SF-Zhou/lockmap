@@ -39,6 +39,27 @@ keys.insert("key2".to_string());
 let mut locked_entries = map.batch_lock::<std::collections::HashMap<_, _>>(keys);
 ```
 
+## FAQ
+
+### Why is the miri test failing?
+
+Running `cargo miri test` will report a Stacked Borrows violation. This is **expected and intentional**. 
+
+The crate uses a pattern where we obtain a raw pointer to heap-allocated data before moving the `Box` into the internal map. This is done to atomically insert and obtain access to the state in a single lock-protected operation: 
+
+```rust
+let mut state: Box<_> = Box::new(State { /* ... */ });
+let ptr = state.as_mut() as *mut State<V>;
+(UpdateAction::Replace(state), ptr)  // Move Box, return pointer
+```
+
+While this violates Miri's experimental [Stacked Borrows](https://github.com/rust-lang/unsafe-code-guidelines/blob/master/wip/stacked-borrows.md) model, it is **safe in practice** because:
+
+1. Moving a `Box` doesn't relocate the heap data—the pointer remains valid
+2. The `refcnt` mechanism guarantees exclusive access to the state
+3. Extensive concurrent tests validate correctness under heavy contention
+
+For a detailed explanation, see [#20](https://github.com/SF-Zhou/lockmap/issues/20).
 
 ## License
 
