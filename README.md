@@ -41,9 +41,9 @@ let mut locked_entries = map.batch_lock::<std::collections::HashMap<_, _>>(keys)
 
 ## FAQ
 
-### Why miri test is failing?
+### Why is the miri test failing?
 
-Running `cargo miri test` will report a Stacked Borrows violation.  This is **expected and intentional**. 
+Running `cargo miri test` will report a Stacked Borrows violation. This is **expected and intentional**. 
 
 The crate uses a pattern where we obtain a raw pointer to heap-allocated data before moving the `Box` into the internal map. This is done to atomically insert and obtain access to the state in a single lock-protected operation: 
 
