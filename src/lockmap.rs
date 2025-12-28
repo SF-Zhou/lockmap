@@ -732,8 +732,13 @@ impl<K: Eq + Hash, V> Drop for EntryByVal<'_, K, V> {
         // SAFETY: The entry holds the lock on the `State`, so it is safe to unlock it.
         unsafe { (*self.state).mutex.unlock() };
 
-        // SAFETY: The pointer `self.state` is valid because it was obtained from the map and its
-        // reference count was incremented, ensuring the `State` won't be dropped while we hold it
+        // SAFETY: The pointer `self.state` remains valid here because the `EntryByVal`
+        // incremented the `State`'s reference count when it was created. While `self` is
+        // alive in this `drop` call, the reference count is therefore at least 1, and this
+        // `fetch_sub(1, ...)` is decrementing that last reference held by the entry. The
+        // `State` is only deallocated once its reference count reaches zero, which can only
+        // occur after this `fetch_sub` completes. Thus, dereferencing `self.state` to access
+        // `refcnt` is safe at this point.
         let prev = (unsafe { &*self.state })
             .refcnt
             .fetch_sub(1, Ordering::AcqRel);
@@ -884,8 +889,13 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> Drop for EntryByRef<'_,
         // SAFETY: The entry holds the lock on the `State`, so it is safe to unlock it.
         unsafe { (*self.state).mutex.unlock() };
 
-        // SAFETY: The pointer `self.state` is valid because it was obtained from the map and its
-        // reference count was incremented, ensuring the `State` won't be dropped while we hold it
+        // SAFETY: The pointer `self.state` remains valid here because the `EntryByRef`
+        // incremented the `State`'s reference count when it was created. While `self` is
+        // alive in this `drop` call, the reference count is therefore at least 1, and this
+        // `fetch_sub(1, ...)` is decrementing that last reference held by the entry. The
+        // `State` is only deallocated once its reference count reaches zero, which can only
+        // occur after this `fetch_sub` completes. Thus, dereferencing `self.state` to access
+        // `refcnt` is safe at this point.
         let prev = (unsafe { &*self.state })
             .refcnt
             .fetch_sub(1, Ordering::AcqRel);
