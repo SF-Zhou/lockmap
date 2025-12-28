@@ -17,23 +17,22 @@ struct State<V> {
     value: UnsafeCell<Option<V>>,
 }
 
-/// # Safety
-/// Safety is ensured by the internal mutex protecting access to `value`.
-/// The `refcnt` is an atomic counter and does not require additional synchronization.
-/// The `mutex` ensures that only one thread can access the `value` at a time.
-/// Therefore, it is safe to share `State<V>` across threads as long as `V` is `Send`.
-/// This is guaranteed by the `LockMap` API which only allows access to `V` through locked entries.
+// SAFETY: `State<V>` is `Sync` if `V` is `Send` because access to the `UnsafeCell<Option<V>>`
+// is strictly controlled by the internal `Mutex`. The `refcnt` is an `AtomicU32` which is
+// inherently thread-safe.
 unsafe impl<V: Send> Sync for State<V> {}
 
 impl<V> State<V> {
     /// # Safety
-    /// Safety is ensured by the internal mutex protecting access to `value`.
+    ///
+    /// The caller must ensure that the internal `mutex` is locked.
     unsafe fn value_ref(&self) -> &Option<V> {
         &*self.value.get()
     }
 
     /// # Safety
-    /// Safety is ensured by the internal mutex protecting access to `value`.
+    ///
+    /// The caller must ensure that the internal `mutex` is locked and they have exclusive access.
     #[allow(clippy::mut_from_ref)]
     unsafe fn value_mut(&self) -> &mut Option<V> {
         &mut *self.value.get()
@@ -239,6 +238,8 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         let value = self.map.simple_update(key, |s| match s {
             Some(state) => {
                 if state.refcnt.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    // SAFETY: We are inside the map's shard lock, and refcnt is 0,
+                    // meaning no other thread can be holding an `Entry` for this key.
                     let value = unsafe { state.value_ref() }.clone();
                     (SimpleAction::Keep, value)
                 } else {
@@ -289,6 +290,8 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         let (ptr, value) = self.map.update(key.clone(), move |s| match s {
             Some(state) => {
                 if state.refcnt.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    // SAFETY: We are inside the map's shard lock, and refcnt is 0,
+                    // meaning no other thread can be holding an `Entry` for this key.
                     let value = unsafe { state.value_mut() }.replace(value);
                     (UpdateAction::Keep, (std::ptr::null_mut(), value))
                 } else {
@@ -347,6 +350,8 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         let (ptr, value) = self.map.update_by_ref(key, move |s| match s {
             Some(state) => {
                 if state.refcnt.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    // SAFETY: We are inside the map's shard lock, and refcnt is 0,
+                    // meaning no other thread can be holding an `Entry` for this key.
                     let value = unsafe { state.value_mut() }.replace(value);
                     (UpdateAction::Keep, (std::ptr::null_mut(), value))
                 } else {
@@ -406,6 +411,8 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         let value = self.map.simple_update(key, |s| match s {
             Some(state) => {
                 if state.refcnt.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    // SAFETY: We are inside the map's shard lock, and refcnt is 0,
+                    // meaning no other thread can be holding an `Entry` for this key.
                     (SimpleAction::Keep, unsafe { state.value_ref() }.is_some())
                 } else {
                     state
@@ -457,6 +464,8 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         let value = self.map.simple_update(key, |s| match s {
             Some(state) => {
                 if state.refcnt.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    // SAFETY: We are inside the map's shard lock, and refcnt is 0,
+                    // meaning no other thread can be holding an `Entry` for this key.
                     let value = unsafe { state.value_mut() }.take();
                     (SimpleAction::Remove, value)
                 } else {
@@ -552,7 +561,13 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
                 let prev = state
                     .refcnt
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                if prev == 1 && unsafe { state.value_ref() }.is_none() {
+                if prev == 1 && unsafe {
+                    // SAFETY: We are inside the map's shard lock, and refcnt was 1 (now 0),
+                    // meaning no other thread can be holding an `Entry` for this key.
+                    state.value_ref()
+                }
+                .is_none()
+                {
                     (SimpleAction::Remove, ())
                 } else {
                     (SimpleAction::Keep, ())
@@ -563,6 +578,10 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     }
 
     fn guard_by_val(&self, ptr: *mut State<V>, key: K) -> EntryByVal<'_, K, V> {
+        // SAFETY: The pointer `ptr` is valid because it was just retrieved from the map
+        // and its reference count was incremented, ensuring it won't be dropped.
+        // The `AliasableBox` in the map ensures the `State<V>` remains at a stable
+        // memory location.
         unsafe { (*ptr).mutex.lock() };
         EntryByVal {
             map: self,
@@ -580,6 +599,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
+        // SAFETY: Same as `guard_by_val`.
         unsafe { (*ptr).mutex.lock() };
         EntryByRef {
             map: self,
@@ -625,8 +645,15 @@ pub struct EntryByVal<'a, K: Eq + Hash, V> {
     state: *mut State<V>,
 }
 
+// SAFETY: `EntryByVal` is `Send` if `K` and `V` are `Send`. It holds a raw pointer to `State<V>`,
+// which is safe to transfer between threads because the entry is locked and the `State`
+// itself is `Sync`.
 unsafe impl<K: Eq + Hash + Send, V: Send> Send for EntryByVal<'_, K, V> {}
-unsafe impl<K: Eq + Hash + Sync, V: Send> Sync for EntryByVal<'_, K, V> {}
+
+// SAFETY: `EntryByVal` is `Sync` if `K` is `Sync` and `V` is `Sync`. Multiple threads can
+// share a reference to `EntryByVal` safely because all access to the underlying value
+// is synchronized by the lock held by the entry.
+unsafe impl<K: Eq + Hash + Sync, V: Sync> Sync for EntryByVal<'_, K, V> {}
 
 impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
     /// Returns a reference to the entry's key.
@@ -644,6 +671,7 @@ impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
     ///
     /// A reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get(&self) -> &Option<V> {
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
         unsafe { (*self.state).value_ref() }
     }
 
@@ -653,6 +681,7 @@ impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
     ///
     /// A mutable reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get_mut(&mut self) -> &mut Option<V> {
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
         unsafe { (*self.state).value_mut() }
     }
 
@@ -689,6 +718,7 @@ impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
     ///
     /// The value that was stored in the entry, or `None` if the entry was vacant.
     pub fn remove(&mut self) -> Option<V> {
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
         unsafe { (*self.state).value_mut() }.take()
     }
 }
@@ -697,13 +727,14 @@ impl<K: Eq + Hash + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Ent
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntryByVal")
             .field("key", &self.key)
-            .field("value", unsafe { (*self.state).value_ref() })
+            .field("value", self.get())
             .finish()
     }
 }
 
 impl<K: Eq + Hash, V> Drop for EntryByVal<'_, K, V> {
     fn drop(&mut self) {
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to unlock it.
         unsafe { (*self.state).mutex.unlock() };
         self.map.unlock(&self.key);
     }
@@ -741,6 +772,9 @@ pub struct EntryByRef<'a, 'b, K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V
     state: *mut State<V>,
 }
 
+// SAFETY: `EntryByRef` is `Send` if `K`, `Q` and `V` are `Send`. It holds a raw pointer to `State<V>`,
+// which is safe to transfer between threads because the entry is locked and the `State`
+// itself is `Sync`.
 unsafe impl<K, Q, V> Send for EntryByRef<'_, '_, K, Q, V>
 where
     K: Eq + Hash + Borrow<Q>,
@@ -749,11 +783,14 @@ where
 {
 }
 
+// SAFETY: `EntryByRef` is `Sync` if `K`, `Q` and `V` are `Sync`. Multiple threads can
+// share a reference to `EntryByRef` safely because all access to the underlying value
+// is synchronized by the lock held by the entry.
 unsafe impl<K, Q, V> Sync for EntryByRef<'_, '_, K, Q, V>
 where
     K: Eq + Hash + Borrow<Q>,
     Q: Eq + Hash + ?Sized + Sync,
-    V: Send,
+    V: Sync,
 {
 }
 
@@ -773,6 +810,7 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q
     ///
     /// A reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get(&self) -> &Option<V> {
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
         unsafe { (*self.state).value_ref() }
     }
 
@@ -782,6 +820,7 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q
     ///
     /// A mutable reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get_mut(&mut self) -> &mut Option<V> {
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
         unsafe { (*self.state).value_mut() }
     }
 
@@ -818,6 +857,7 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q
     ///
     /// The value that was stored in the entry, or `None` if the entry was vacant.
     pub fn remove(&mut self) -> Option<V> {
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
         self.get_mut().take()
     }
 }
@@ -831,13 +871,14 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntryByRef")
             .field("key", &self.key)
-            .field("value", unsafe { (*self.state).value_ref() })
+            .field("value", self.get())
             .finish()
     }
 }
 
 impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> Drop for EntryByRef<'_, '_, K, Q, V> {
     fn drop(&mut self) {
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to unlock it.
         unsafe { (*self.state).mutex.unlock() };
         self.map.unlock(self.key);
     }
