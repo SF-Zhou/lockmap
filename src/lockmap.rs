@@ -1,7 +1,10 @@
 use crate::{Mutex, ShardsMap, SimpleAction, UpdateAction};
+use aliasable::boxed::AliasableBox;
 use std::borrow::Borrow;
+use std::cell::UnsafeCell;
 use std::collections::BTreeSet;
 use std::hash::Hash;
+use std::sync::atomic::AtomicU32;
 use std::sync::OnceLock;
 
 /// Internal state for a key-value pair in the `LockMap`.
@@ -9,14 +12,36 @@ use std::sync::OnceLock;
 /// This type manages both the stored value and the queue of waiting threads
 /// for per-key synchronization.
 struct State<V> {
-    refcnt: u32,
+    refcnt: AtomicU32,
     mutex: Mutex,
-    value: Option<V>,
+    value: UnsafeCell<Option<V>>,
+}
+
+// SAFETY: `State<V>` is `Sync` if `V` is `Send` because access to the `UnsafeCell<Option<V>>`
+// is strictly controlled by the internal `Mutex`. The `refcnt` is an `AtomicU32` which is
+// inherently thread-safe.
+unsafe impl<V: Send> Sync for State<V> {}
+
+impl<V> State<V> {
+    /// # Safety
+    ///
+    /// The caller must ensure that the internal `mutex` is locked.
+    unsafe fn value_ref(&self) -> &Option<V> {
+        &*self.value.get()
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure that the internal `mutex` is locked and they have exclusive access.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn value_mut(&self) -> &mut Option<V> {
+        &mut *self.value.get()
+    }
 }
 
 /// A thread-safe hashmap that supports locking entries at the key level.
 pub struct LockMap<K, V> {
-    map: ShardsMap<K, Box<State<V>>>,
+    map: ShardsMap<K, AliasableBox<State<V>>>,
 }
 
 impl<K: Eq + Hash, V> Default for LockMap<K, V> {
@@ -113,17 +138,19 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     {
         let ptr: *mut State<V> = self.map.update(key.clone(), |s| match s {
             Some(state) => {
-                state.refcnt += 1;
-                let ptr = state.as_mut() as _;
+                state
+                    .refcnt
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let ptr = &**state as *const State<V> as *mut State<V>;
                 (UpdateAction::Keep, ptr)
             }
             None => {
-                let mut state: Box<_> = Box::new(State {
-                    refcnt: 1,
+                let state = AliasableBox::from_unique(Box::new(State {
+                    refcnt: AtomicU32::new(1),
                     mutex: Mutex::new(),
-                    value: None,
-                });
-                let ptr = state.as_mut() as _;
+                    value: UnsafeCell::new(None),
+                }));
+                let ptr = &*state as *const State<V> as *mut State<V>;
                 (UpdateAction::Replace(state), ptr)
             }
         });
@@ -158,17 +185,19 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     {
         let ptr: *mut State<V> = self.map.update_by_ref(key, |s| match s {
             Some(state) => {
-                state.refcnt += 1;
-                let ptr = state.as_mut() as _;
+                state
+                    .refcnt
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let ptr = &**state as *const State<V> as *mut State<V>;
                 (UpdateAction::Keep, ptr)
             }
             None => {
-                let mut state: Box<_> = Box::new(State {
-                    refcnt: 1,
+                let state = AliasableBox::from_unique(Box::new(State {
+                    refcnt: AtomicU32::new(1),
                     mutex: Mutex::new(),
-                    value: None,
-                });
-                let ptr = state.as_mut() as _;
+                    value: UnsafeCell::new(None),
+                }));
+                let ptr = &*state as *const State<V> as *mut State<V>;
                 (UpdateAction::Replace(state), ptr)
             }
         });
@@ -208,12 +237,16 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         let mut ptr: *mut State<V> = std::ptr::null_mut();
         let value = self.map.simple_update(key, |s| match s {
             Some(state) => {
-                if state.refcnt == 0 {
-                    let value = state.value.clone();
+                if state.refcnt.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    // SAFETY: We are inside the map's shard lock, and refcnt is 0,
+                    // meaning no other thread can be holding an `Entry` for this key.
+                    let value = unsafe { state.value_ref() }.clone();
                     (SimpleAction::Keep, value)
                 } else {
-                    state.refcnt += 1;
-                    ptr = state.as_mut();
+                    state
+                        .refcnt
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ptr = &**state as *const State<V> as *mut State<V>;
                     (SimpleAction::Keep, None)
                 }
             }
@@ -256,21 +289,25 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     {
         let (ptr, value) = self.map.update(key.clone(), move |s| match s {
             Some(state) => {
-                if state.refcnt == 0 {
-                    let value = state.value.replace(value);
+                if state.refcnt.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    // SAFETY: We are inside the map's shard lock, and refcnt is 0,
+                    // meaning no other thread can be holding an `Entry` for this key.
+                    let value = unsafe { state.value_mut() }.replace(value);
                     (UpdateAction::Keep, (std::ptr::null_mut(), value))
                 } else {
-                    state.refcnt += 1;
-                    let ptr: *mut State<V> = state.as_mut();
+                    state
+                        .refcnt
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let ptr: *mut State<V> = &**state as *const State<V> as *mut State<V>;
                     (UpdateAction::Keep, (ptr, Some(value)))
                 }
             }
             None => {
-                let state: Box<_> = Box::new(State {
-                    refcnt: 0,
+                let state = AliasableBox::from_unique(Box::new(State {
+                    refcnt: AtomicU32::new(0),
                     mutex: Mutex::new(),
-                    value: Some(value),
-                });
+                    value: UnsafeCell::new(Some(value)),
+                }));
                 (UpdateAction::Replace(state), (std::ptr::null_mut(), None))
             }
         });
@@ -312,21 +349,25 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     {
         let (ptr, value) = self.map.update_by_ref(key, move |s| match s {
             Some(state) => {
-                if state.refcnt == 0 {
-                    let value = state.value.replace(value);
+                if state.refcnt.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    // SAFETY: We are inside the map's shard lock, and refcnt is 0,
+                    // meaning no other thread can be holding an `Entry` for this key.
+                    let value = unsafe { state.value_mut() }.replace(value);
                     (UpdateAction::Keep, (std::ptr::null_mut(), value))
                 } else {
-                    state.refcnt += 1;
-                    let ptr: *mut State<V> = state.as_mut();
+                    state
+                        .refcnt
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let ptr: *mut State<V> = &**state as *const State<V> as *mut State<V>;
                     (UpdateAction::Keep, (ptr, Some(value)))
                 }
             }
             None => {
-                let state: Box<_> = Box::new(State {
-                    refcnt: 0,
+                let state = AliasableBox::from_unique(Box::new(State {
+                    refcnt: AtomicU32::new(0),
                     mutex: Mutex::new(),
-                    value: Some(value),
-                });
+                    value: UnsafeCell::new(Some(value)),
+                }));
                 (UpdateAction::Replace(state), (std::ptr::null_mut(), None))
             }
         });
@@ -369,11 +410,15 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         let mut ptr: *mut State<V> = std::ptr::null_mut();
         let value = self.map.simple_update(key, |s| match s {
             Some(state) => {
-                if state.refcnt == 0 {
-                    (SimpleAction::Keep, state.value.is_some())
+                if state.refcnt.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    // SAFETY: We are inside the map's shard lock, and refcnt is 0,
+                    // meaning no other thread can be holding an `Entry` for this key.
+                    (SimpleAction::Keep, unsafe { state.value_ref() }.is_some())
                 } else {
-                    state.refcnt += 1;
-                    ptr = state.as_mut();
+                    state
+                        .refcnt
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ptr = &**state as *const State<V> as *mut State<V>;
                     (SimpleAction::Keep, false)
                 }
             }
@@ -418,12 +463,16 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         let mut ptr: *mut State<V> = std::ptr::null_mut();
         let value = self.map.simple_update(key, |s| match s {
             Some(state) => {
-                if state.refcnt == 0 {
-                    let value = state.value.take();
+                if state.refcnt.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    // SAFETY: We are inside the map's shard lock, and refcnt is 0,
+                    // meaning no other thread can be holding an `Entry` for this key.
+                    let value = unsafe { state.value_mut() }.take();
                     (SimpleAction::Remove, value)
                 } else {
-                    state.refcnt += 1;
-                    ptr = state.as_mut();
+                    state
+                        .refcnt
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ptr = &**state as *const State<V> as *mut State<V>;
                     (SimpleAction::Keep, None)
                 }
             }
@@ -509,8 +558,16 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     {
         self.map.simple_update(key, |value| match value {
             Some(state) => {
-                state.refcnt -= 1;
-                if state.value.is_none() && state.refcnt == 0 {
+                let prev = state
+                    .refcnt
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if prev == 1 && unsafe {
+                    // SAFETY: We are inside the map's shard lock, and refcnt was 1 (now 0),
+                    // meaning no other thread can be holding an `Entry` for this key.
+                    state.value_ref()
+                }
+                .is_none()
+                {
                     (SimpleAction::Remove, ())
                 } else {
                     (SimpleAction::Keep, ())
@@ -521,12 +578,15 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     }
 
     fn guard_by_val(&self, ptr: *mut State<V>, key: K) -> EntryByVal<'_, K, V> {
-        let state = unsafe { &mut *ptr };
-        state.mutex.lock();
+        // SAFETY: The pointer `ptr` is valid because it was just retrieved from the map
+        // and its reference count was incremented, ensuring it won't be dropped.
+        // The `AliasableBox` in the map ensures the `State<V>` remains at a stable
+        // memory location.
+        unsafe { (*ptr).mutex.lock() };
         EntryByVal {
             map: self,
             key,
-            state,
+            state: ptr,
         }
     }
 
@@ -539,12 +599,12 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let state = unsafe { &mut *ptr };
-        state.mutex.lock();
+        // SAFETY: Same as `guard_by_val`.
+        unsafe { (*ptr).mutex.lock() };
         EntryByRef {
             map: self,
             key,
-            state,
+            state: ptr,
         }
     }
 }
@@ -582,8 +642,18 @@ impl<K, V> std::fmt::Debug for LockMap<K, V> {
 pub struct EntryByVal<'a, K: Eq + Hash, V> {
     map: &'a LockMap<K, V>,
     key: K,
-    state: &'a mut State<V>,
+    state: *mut State<V>,
 }
+
+// SAFETY: `EntryByVal` is `Send` if `K` and `V` are `Send`. It holds a raw pointer to `State<V>`,
+// which is safe to transfer between threads because the entry is locked and the `State`
+// itself is `Sync`.
+unsafe impl<K: Eq + Hash + Send, V: Send> Send for EntryByVal<'_, K, V> {}
+
+// SAFETY: `EntryByVal` is `Sync` if `K` is `Sync` and `V` is `Sync`. Multiple threads can
+// share a reference to `EntryByVal` safely because all access to the underlying value
+// is synchronized by the lock held by the entry.
+unsafe impl<K: Eq + Hash + Sync, V: Sync> Sync for EntryByVal<'_, K, V> {}
 
 impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
     /// Returns a reference to the entry's key.
@@ -601,7 +671,8 @@ impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
     ///
     /// A reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get(&self) -> &Option<V> {
-        &self.state.value
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
+        unsafe { (*self.state).value_ref() }
     }
 
     /// Returns a mutable reference to the entry's value.
@@ -610,7 +681,8 @@ impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
     ///
     /// A mutable reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get_mut(&mut self) -> &mut Option<V> {
-        &mut self.state.value
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
+        unsafe { (*self.state).value_mut() }
     }
 
     /// Sets the value of the entry, returning the old value if it existed.
@@ -623,7 +695,7 @@ impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
     ///
     /// The previous value if the entry was occupied, or `None` if it was vacant.
     pub fn insert(&mut self, value: V) -> Option<V> {
-        self.state.value.replace(value)
+        self.get_mut().replace(value)
     }
 
     /// Swaps the value of the entry with the provided value.
@@ -636,7 +708,7 @@ impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
     ///
     /// The previous value of the entry.
     pub fn swap(&mut self, mut value: Option<V>) -> Option<V> {
-        std::mem::swap(&mut self.state.value, &mut value);
+        std::mem::swap(self.get_mut(), &mut value);
         value
     }
 
@@ -646,7 +718,8 @@ impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
     ///
     /// The value that was stored in the entry, or `None` if the entry was vacant.
     pub fn remove(&mut self) -> Option<V> {
-        self.state.value.take()
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
+        unsafe { (*self.state).value_mut() }.take()
     }
 }
 
@@ -654,14 +727,15 @@ impl<K: Eq + Hash + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Ent
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntryByVal")
             .field("key", &self.key)
-            .field("value", &self.state.value)
+            .field("value", self.get())
             .finish()
     }
 }
 
 impl<K: Eq + Hash, V> Drop for EntryByVal<'_, K, V> {
     fn drop(&mut self) {
-        self.state.mutex.unlock();
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to unlock it.
+        unsafe { (*self.state).mutex.unlock() };
         self.map.unlock(&self.key);
     }
 }
@@ -695,7 +769,29 @@ impl<K: Eq + Hash, V> Drop for EntryByVal<'_, K, V> {
 pub struct EntryByRef<'a, 'b, K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> {
     map: &'a LockMap<K, V>,
     key: &'b Q,
-    state: &'a mut State<V>,
+    state: *mut State<V>,
+}
+
+// SAFETY: `EntryByRef` is `Send` if `K`, `Q` and `V` are `Send`. It holds a raw pointer to `State<V>`,
+// which is safe to transfer between threads because the entry is locked and the `State`
+// itself is `Sync`.
+unsafe impl<K, Q, V> Send for EntryByRef<'_, '_, K, Q, V>
+where
+    K: Eq + Hash + Borrow<Q>,
+    Q: Eq + Hash + ?Sized + Sync,
+    V: Send,
+{
+}
+
+// SAFETY: `EntryByRef` is `Sync` if `K`, `Q` and `V` are `Sync`. Multiple threads can
+// share a reference to `EntryByRef` safely because all access to the underlying value
+// is synchronized by the lock held by the entry.
+unsafe impl<K, Q, V> Sync for EntryByRef<'_, '_, K, Q, V>
+where
+    K: Eq + Hash + Borrow<Q>,
+    Q: Eq + Hash + ?Sized + Sync,
+    V: Sync,
+{
 }
 
 impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q, V> {
@@ -714,7 +810,8 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q
     ///
     /// A reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get(&self) -> &Option<V> {
-        &self.state.value
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
+        unsafe { (*self.state).value_ref() }
     }
 
     /// Returns a mutable reference to the entry's value.
@@ -723,7 +820,8 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q
     ///
     /// A mutable reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get_mut(&mut self) -> &mut Option<V> {
-        &mut self.state.value
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
+        unsafe { (*self.state).value_mut() }
     }
 
     /// Sets the value of the entry, returning the old value if it existed.
@@ -736,7 +834,7 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q
     ///
     /// The previous value if the entry was occupied, or `None` if it was vacant.
     pub fn insert(&mut self, value: V) -> Option<V> {
-        self.state.value.replace(value)
+        self.get_mut().replace(value)
     }
 
     /// Swaps the value of the entry with the provided value.
@@ -749,7 +847,7 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q
     ///
     /// The previous value of the entry.
     pub fn swap(&mut self, mut value: Option<V>) -> Option<V> {
-        std::mem::swap(&mut self.state.value, &mut value);
+        std::mem::swap(self.get_mut(), &mut value);
         value
     }
 
@@ -759,7 +857,8 @@ impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q
     ///
     /// The value that was stored in the entry, or `None` if the entry was vacant.
     pub fn remove(&mut self) -> Option<V> {
-        self.state.value.take()
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
+        self.get_mut().take()
     }
 }
 
@@ -772,14 +871,15 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntryByRef")
             .field("key", &self.key)
-            .field("value", &self.state.value)
+            .field("value", self.get())
             .finish()
     }
 }
 
 impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> Drop for EntryByRef<'_, '_, K, Q, V> {
     fn drop(&mut self) {
-        self.state.mutex.unlock();
+        // SAFETY: The entry holds the lock on the `State`, so it is safe to unlock it.
+        unsafe { (*self.state).mutex.unlock() };
         self.map.unlock(self.key);
     }
 }
@@ -861,15 +961,15 @@ mod tests {
     #[should_panic(expected = "impossible: unlock a non-existent key!")]
     fn test_lockmap_invalid_unlock() {
         let map = LockMap::<u32, u32>::new();
-        let mut state = State {
-            refcnt: 1,
+        let state = State {
+            refcnt: AtomicU32::new(1),
             mutex: Mutex::new(),
-            value: None,
+            value: UnsafeCell::new(None),
         };
         let _ = EntryByVal {
             map: &map,
             key: 7268,
-            state: &mut state,
+            state: &state as *const State<u32> as *mut State<u32>,
         };
     }
 
@@ -877,7 +977,10 @@ mod tests {
     fn test_lockmap_same_key_by_value() {
         let lock_map = Arc::new(LockMap::<usize, usize>::with_capacity(256));
         let current = Arc::new(AtomicU32::default());
+        #[cfg(not(miri))]
         const N: usize = 1 << 20;
+        #[cfg(miri)]
+        const N: usize = 1 << 6;
         const M: usize = 4;
 
         const S: usize = 0;
@@ -911,7 +1014,10 @@ mod tests {
     fn test_lockmap_same_key_by_ref() {
         let lock_map = Arc::new(LockMap::<String, usize>::with_capacity(256));
         let current = Arc::new(AtomicU32::default());
+        #[cfg(not(miri))]
         const N: usize = 1 << 20;
+        #[cfg(miri)]
+        const N: usize = 1 << 6;
         const M: usize = 4;
 
         const S: &str = "hello";
@@ -947,7 +1053,10 @@ mod tests {
     fn test_lockmap_random_key() {
         let lock_map = Arc::new(LockMap::<u32, u32>::with_capacity_and_shard_amount(256, 16));
         let total = Arc::new(AtomicU32::default());
+        #[cfg(not(miri))]
         const N: usize = 1 << 12;
+        #[cfg(miri)]
+        const N: usize = 1 << 6;
         const M: usize = 8;
 
         let threads = (0..M)
@@ -975,7 +1084,10 @@ mod tests {
     fn test_lockmap_random_batch_lock() {
         let lock_map = Arc::new(LockMap::<u32, u32>::with_capacity_and_shard_amount(256, 16));
         let total = Arc::new(AtomicU32::default());
+        #[cfg(not(miri))]
         const N: usize = 1 << 16;
+        #[cfg(miri)]
+        const N: usize = 1 << 6;
         const M: usize = 8;
 
         let threads = (0..M)
@@ -986,12 +1098,12 @@ mod tests {
                     for _ in 0..N {
                         let keys = (0..3).map(|_| rand::random::<u32>() % 32).collect();
                         let mut entries: HashMap<_, _> = lock_map.batch_lock(keys);
-                        for (_key, entry) in &mut entries {
+                        for entry in entries.values_mut() {
                             assert!(entry.get().is_none());
                             entry.insert(1);
                         }
                         total.fetch_add(1, Ordering::AcqRel);
-                        for (_key, entry) in &mut entries {
+                        for entry in entries.values_mut() {
                             entry.remove();
                         }
                     }
@@ -1006,7 +1118,10 @@ mod tests {
     #[test]
     fn test_lockmap_get_set() {
         let lock_map = Arc::new(LockMap::<u32, u32>::with_capacity_and_shard_amount(256, 16));
+        #[cfg(not(miri))]
         const N: usize = 1 << 20;
+        #[cfg(miri)]
+        const N: usize = 1 << 6;
 
         let entry_thread = {
             let lock_map = lock_map.clone();
@@ -1062,7 +1177,10 @@ mod tests {
         let lock_map = Arc::new(LockMap::<String, u32>::with_capacity_and_shard_amount(
             256, 16,
         ));
+        #[cfg(not(miri))]
         const N: usize = 1 << 18;
+        #[cfg(miri)]
+        const N: usize = 1 << 6;
 
         let entry_thread = {
             let lock_map = lock_map.clone();
@@ -1116,8 +1234,14 @@ mod tests {
     #[test]
     fn test_lockmap_heavy_contention() {
         let lock_map = Arc::new(LockMap::<u32, u32>::new());
+        #[cfg(not(miri))]
         const THREADS: usize = 16;
+        #[cfg(miri)]
+        const THREADS: usize = 4;
+        #[cfg(not(miri))]
         const OPS_PER_THREAD: usize = 10000;
+        #[cfg(miri)]
+        const OPS_PER_THREAD: usize = 10;
         const HOT_KEYS: u32 = 5;
 
         let counter = Arc::new(AtomicU32::new(0));

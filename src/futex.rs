@@ -77,7 +77,7 @@ impl Mutex {
     /// Acquires the lock, blocking the current thread until it becomes available.
     ///
     /// This function will not return until the lock has been acquired.
-    /// 
+    ///
     /// # Panics
     ///
     /// This function may panic if the current thread already holds the lock.

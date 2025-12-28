@@ -83,7 +83,7 @@ where
     /// # Arguments
     ///
     /// * `key` - The key to update
-    /// * `func` - A function that takes an `Option<&mut V>` and returns a tuple containing 
+    /// * `func` - A function that takes an `Option<&mut V>` and returns a tuple containing
     ///   the action to take (`SimpleAction::Keep` or `SimpleAction::Remove`) and a result value
     ///
     /// # Returns
