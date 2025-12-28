@@ -697,7 +697,7 @@ impl<K: Eq + Hash + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Ent
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntryByVal")
             .field("key", &self.key)
-            .field("value", unsafe { &(*self.state).value })
+            .field("value", unsafe { (*self.state).value_ref() })
             .finish()
     }
 }
@@ -831,7 +831,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntryByRef")
             .field("key", &self.key)
-            .field("value", unsafe { &(*self.state).value })
+            .field("value", unsafe { (*self.state).value_ref() })
             .finish()
     }
 }
