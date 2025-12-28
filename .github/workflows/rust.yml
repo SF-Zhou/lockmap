@@ -44,3 +44,17 @@ jobs:
         token: ${{ secrets.CODECOV_TOKEN }}
         slug: SF-Zhou/lockmap
         files: target/nextest/default/junit.xml
+
+  miri:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Run Miri tests
+        run: cargo miri test lockmap::tests

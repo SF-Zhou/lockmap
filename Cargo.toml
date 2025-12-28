@@ -10,6 +10,7 @@ description = "A high-performance, thread-safe HashMap implementation for Rust t
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+aliasable = "0.1.3"
 atomic-wait = "1"
 foldhash = "0.1.5"
 
