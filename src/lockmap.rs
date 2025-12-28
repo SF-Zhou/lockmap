@@ -553,8 +553,11 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     {
         self.map.simple_update(key, |value| match value {
             Some(state) => {
-                // SAFETY: We are inside the map's shard lock, and refcnt is 0,
-                // meaning no other thread can be holding an `Entry` for this key.
+                // SAFETY: We are inside the map's shard lock. If `refcnt` is 0 here,
+                // then no `Entry` is currently held for this key, and no other thread
+                // can increment `refcnt` without first acquiring this same shard lock.
+                // Therefore, if the stored value is also `None`, it is safe to remove
+                // the entry from the map.
                 if state.refcnt.load(Ordering::Acquire) == 0
                     && unsafe { state.value_ref() }.is_none()
                 {
