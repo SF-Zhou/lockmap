@@ -53,7 +53,7 @@ assert_eq!(map.get("key"), Some("value".into()));
     // Check value
     assert_eq!(entry.get().as_deref(), Some("value"));
 
-    // Update value atomicity
+    // Update value atomically
     entry.insert("new value".to_string());
 } // Lock is automatically released here
 
