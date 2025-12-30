@@ -61,6 +61,12 @@ impl<V> State<V> {
         StateFlags(self.flags.load(Ordering::Acquire))
     }
 
+    /// Increments the reference count.
+    ///
+    /// # Note
+    ///
+    /// The reference count uses 31 bits, supporting up to 2^31 concurrent references.
+    /// Overflow is not checked; exceeding this limit causes undefined behavior.
     fn inc_ref(&self) -> StateFlags {
         StateFlags(self.flags.fetch_add(1, Ordering::AcqRel) + 1)
     }
@@ -260,6 +266,13 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     /// # Returns
     /// * `Some(V)` if the key exists
     /// * `None` if the key doesn't exist
+    ///
+    /// # Performance Note
+    ///
+    /// When no other thread holds an entry for this key, the `clone()` operation
+    /// is performed while holding the shard lock. If `V::clone()` is expensive,
+    /// consider using `entry()` or `entry_by_ref()` combined with `Entry::get()`
+    /// to avoid blocking other keys in the same shard.
     ///
     /// **Locking behaviour:** Deadlock if called when holding the same entry.
     ///

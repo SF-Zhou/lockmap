@@ -9,6 +9,7 @@
 //! - Entry API for exclusive access to values
 //! - Efficient concurrent operations through sharding
 //! - Safe atomic updates
+//! - No poisoning, the lock is released normally on panic
 //!
 //! # Examples
 //! ```
