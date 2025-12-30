@@ -1,4 +1,4 @@
-use foldhash::fast::{FixedState, RandomState};
+use foldhash::fast::RandomState;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash};
@@ -195,6 +195,7 @@ where
 pub struct ShardsMap<K, V> {
     /// The vector of `ShardMap` instances.
     shards: Vec<ShardMap<K, V>>,
+    hasher: RandomState,
 }
 
 impl<K, V> ShardsMap<K, V>
@@ -217,6 +218,7 @@ where
             shards: (0..shard_amount)
                 .map(|_| ShardMap::with_capacity(shard_capacity))
                 .collect::<Vec<_>>(),
+            hasher: RandomState::default(),
         }
     }
 
@@ -311,7 +313,7 @@ where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let idx = FixedState::default().hash_one(key) as usize % self.shards.len();
+        let idx = self.hasher.hash_one(key) as usize % self.shards.len();
         &self.shards[idx]
     }
 }
