@@ -165,6 +165,7 @@ impl LruList {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     struct TestNode {
         list_node: ListNode,
         value: i32,

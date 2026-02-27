@@ -48,6 +48,12 @@ const LOCKED: u32 = 1;
 /// Represents a locked mutex with threads waiting for acquisition.
 const CONTENDED: u32 = 2;
 
+impl Default for Mutex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Mutex {
     /// Creates a new mutex in the unlocked state.
     ///

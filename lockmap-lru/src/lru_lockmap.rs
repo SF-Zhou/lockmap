@@ -33,6 +33,7 @@ impl<V> LruState<V> {
         &*self.value.get()
     }
 
+    #[allow(clippy::mut_from_ref)]
     unsafe fn value_mut(&self) -> &mut Option<V> {
         &mut *self.value.get()
     }

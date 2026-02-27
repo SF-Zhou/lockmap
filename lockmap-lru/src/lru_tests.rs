@@ -116,7 +116,10 @@ mod tests {
 
         // Remove some
         for i in 10..15 {
-            assert_eq!(map.remove(&format!("key{}", i)), Some(format!("value{}", i)));
+            assert_eq!(
+                map.remove(&format!("key{}", i)),
+                Some(format!("value{}", i))
+            );
         }
 
         // Update some
@@ -142,7 +145,12 @@ mod tests {
 
         // Map should not exceed capacity (with some tolerance for eviction timing)
         let len = map.len();
-        assert!(len <= CAPACITY + 2, "Map size {} should be close to capacity {}", len, CAPACITY);
+        assert!(
+            len <= CAPACITY + 2,
+            "Map size {} should be close to capacity {}",
+            len,
+            CAPACITY
+        );
     }
 
     #[test]
