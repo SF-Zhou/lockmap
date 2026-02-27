@@ -1,4 +1,4 @@
-use crate::{Mutex, ShardsMap, SimpleAction, UpdateAction};
+use lockmap_core::{Mutex, ShardsMap, SimpleAction, UpdateAction};
 use aliasable::boxed::AliasableBox;
 use std::borrow::Borrow;
 use std::cell::UnsafeCell;

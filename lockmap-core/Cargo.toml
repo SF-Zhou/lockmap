@@ -1,0 +1,14 @@
+[package]
+name = "lockmap-core"
+version = "0.1.0"
+edition = "2021"
+
+authors = ["SF-Zhou <sfzhou.scut@gmail.com>"]
+homepage = "https://github.com/SF-Zhou/lockmap"
+repository = "https://github.com/SF-Zhou/lockmap"
+description = "Core utilities for the lockmap family of crates, including a fast futex-based mutex and sharded map infrastructure."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+atomic-wait = "1"
+foldhash = "0.1.5"
