@@ -1,0 +1,21 @@
+[package]
+name = "lockmap"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "A high-performance, thread-safe HashMap implementation for Rust that provides fine-grained locking at the key level."
+
+[dependencies]
+lockmap-core.workspace = true
+aliasable.workspace = true
+
+[dev-dependencies]
+criterion = "0"
+rand = "0"
+
+[[bench]]
+name = "bench_lockmap"
+harness = false

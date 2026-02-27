@@ -1,0 +1,16 @@
+[package]
+name = "lockmap-lru"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "LRU-enabled variant of lockmap with automatic capacity management"
+
+[dependencies]
+lockmap-core.workspace = true
+aliasable.workspace = true
+
+[dev-dependencies]
+rand = "0"

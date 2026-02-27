@@ -31,11 +31,8 @@
 //! assert_eq!(map.remove("key1"), Some(42));
 //! assert_eq!(map.get("key1"), None);
 //! ```
-mod futex;
 #[doc = include_str!("../README.md")]
 mod lockmap;
-mod shards_map;
 
-use futex::*;
 pub use lockmap::*;
-use shards_map::*;
+pub use lockmap_core::{Mutex, ShardMap, ShardsMap, SimpleAction, UpdateAction};
