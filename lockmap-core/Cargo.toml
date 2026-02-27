@@ -10,5 +10,5 @@ description = "Core utilities for the lockmap family of crates, including a fast
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-atomic-wait = "1"
-foldhash = "0.1.5"
+atomic-wait.workspace = true
+foldhash.workspace = true

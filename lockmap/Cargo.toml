@@ -10,7 +10,7 @@ description = "A high-performance, thread-safe HashMap implementation for Rust t
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-aliasable = "0.1.3"
+aliasable.workspace = true
 lockmap-core = { version = "0.1.0", path = "../lockmap-core" }
 
 [dev-dependencies]

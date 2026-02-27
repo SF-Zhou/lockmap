@@ -10,8 +10,8 @@ description = "A high-performance, thread-safe LRU cache built on lockmap's per-
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-aliasable = "0.1.3"
-foldhash = "0.1.5"
+aliasable.workspace = true
+foldhash.workspace = true
 lockmap-core = { version = "0.1.0", path = "../lockmap-core" }
 
 [dev-dependencies]

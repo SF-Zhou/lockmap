@@ -5,3 +5,8 @@ members = [
     "lockmap-lru",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+aliasable = "0.1"
+atomic-wait = "1.1"
+foldhash = "0.2"
