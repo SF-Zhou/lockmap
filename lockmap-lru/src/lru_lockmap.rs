@@ -873,9 +873,7 @@ unsafe impl<
 {
 }
 
-impl<K: Eq + Hash + Clone + Borrow<Q>, Q: Eq + Hash + ?Sized, V>
-    LruEntryByRef<'_, '_, K, Q, V>
-{
+impl<K: Eq + Hash + Clone + Borrow<Q>, Q: Eq + Hash + ?Sized, V> LruEntryByRef<'_, '_, K, Q, V> {
     /// Returns a reference to the entry's key.
     pub fn key(&self) -> &Q {
         self.key
@@ -1446,5 +1444,158 @@ mod tests {
             assert_eq!(old, Some(10));
         }
         assert_eq!(cache.get(&1), Some(20));
+    }
+
+    #[test]
+    fn test_lockmap_same_key_by_ref() {
+        let lock_map = Arc::new(LruLockMap::<String, usize>::new(1 << 20));
+        let current = Arc::new(AtomicU32::default());
+        #[cfg(not(miri))]
+        const N: usize = 1 << 20;
+        #[cfg(miri)]
+        const N: usize = 1 << 6;
+        const M: usize = 4;
+
+        const S: &str = "hello";
+        lock_map.insert_by_ref(S, 0);
+
+        let threads = (0..M)
+            .map(|_| {
+                let lock_map = lock_map.clone();
+                let current = current.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..N {
+                        let mut entry = lock_map.entry_by_ref(S);
+                        let now = current.fetch_add(1, Ordering::AcqRel);
+                        assert_eq!(now, 0);
+                        let v = entry.get_mut().as_mut().unwrap();
+                        *v += 1;
+                        let now = current.fetch_sub(1, Ordering::AcqRel);
+                        assert_eq!(now, 1);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+
+        let mut entry = lock_map.entry_by_ref(S);
+        println!("{:?}", entry);
+        assert_eq!(entry.key(), S);
+        assert_eq!(*entry.get(), Some(N * M));
+        assert_eq!(entry.insert(0).unwrap(), N * M);
+    }
+
+    #[test]
+    fn test_lockmap_get_set_by_ref() {
+        let lock_map = Arc::new(LruLockMap::<String, u32>::with_capacity_and_shard_amount(
+            1 << 20,
+            16,
+        ));
+        #[cfg(not(miri))]
+        const N: usize = 1 << 18;
+        #[cfg(miri)]
+        const N: usize = 1 << 6;
+
+        let entry_thread = {
+            let lock_map = lock_map.clone();
+            std::thread::spawn(move || {
+                for _ in 0..N {
+                    let key = (rand::random::<u32>() % 32).to_string();
+                    let value = rand::random::<u32>() % 32;
+                    let mut entry = lock_map.entry_by_ref(&key);
+                    if value < 16 {
+                        entry.get_mut().take();
+                    } else {
+                        entry.get_mut().replace(value);
+                    }
+                }
+            })
+        };
+
+        let set_thread = {
+            let lock_map = lock_map.clone();
+            std::thread::spawn(move || {
+                for _ in 0..N {
+                    let key = (rand::random::<u32>() % 32).to_string();
+                    let value = rand::random::<u32>() % 32;
+                    if value < 16 {
+                        lock_map.remove(&key);
+                    } else {
+                        lock_map.insert_by_ref(&key, value);
+                    }
+                }
+            })
+        };
+
+        let get_thread = {
+            let lock_map = lock_map.clone();
+            std::thread::spawn(move || {
+                for _ in 0..N {
+                    let key = (rand::random::<u32>() % 32).to_string();
+                    let value = lock_map.get(&key);
+                    if let Some(v) = value {
+                        assert!(v >= 16)
+                    }
+                }
+            })
+        };
+
+        entry_thread.join().unwrap();
+        set_thread.join().unwrap();
+        get_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_lockmap_heavy_contention() {
+        let lock_map = Arc::new(LruLockMap::<u32, u32>::new(1 << 20));
+        #[cfg(not(miri))]
+        const THREADS: usize = 16;
+        #[cfg(miri)]
+        const THREADS: usize = 4;
+        #[cfg(not(miri))]
+        const OPS_PER_THREAD: usize = 10000;
+        #[cfg(miri)]
+        const OPS_PER_THREAD: usize = 10;
+        const HOT_KEYS: u32 = 5;
+
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let lock_map = lock_map.clone();
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..OPS_PER_THREAD {
+                        let key = rand::random::<u32>() % HOT_KEYS;
+                        let mut entry = lock_map.entry(key);
+
+                        // Simulate some work
+                        std::thread::sleep(std::time::Duration::from_nanos(10));
+
+                        match entry.get_mut() {
+                            Some(value) => {
+                                *value = value.wrapping_add(1);
+                                counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                            None => {
+                                entry.insert(1);
+                                counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        drop(entry);
+                        assert!(lock_map.contains_key(&key), "Key {} should exist", key);
+                    }
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            THREADS as u32 * OPS_PER_THREAD as u32
+        );
     }
 }

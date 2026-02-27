@@ -1,5 +1,5 @@
-use lockmap_core::{Mutex, ShardsMap, SimpleAction, UpdateAction};
 use aliasable::boxed::AliasableBox;
+use lockmap_core::{Mutex, ShardsMap, SimpleAction, UpdateAction};
 use std::borrow::Borrow;
 use std::cell::UnsafeCell;
 use std::collections::BTreeSet;
