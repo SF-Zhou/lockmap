@@ -194,15 +194,9 @@ impl<K: Eq + Hash, V> LruShardInner<K, V> {
     ///
     /// Entries that are currently in use (refcnt > 0) are skipped — eviction is
     /// deferred until a future access triggers another eviction pass.
-    fn try_evict(&mut self)
-    where
-        K: Clone,
-    {
-        while self.map.len() > self.capacity {
+    fn try_evict(&mut self) {
+        while self.map.len() > self.capacity && !self.tail.is_null() {
             let tail = self.tail;
-            if tail.is_null() {
-                break;
-            }
 
             // SAFETY: `tail` is a valid pointer to a State in the list (maintained by push_front/detach).
             let state = unsafe { &*tail };
@@ -212,16 +206,12 @@ impl<K: Eq + Hash, V> LruShardInner<K, V> {
                 break;
             }
 
-            // Clone the key so we can use it to remove from the HashMap after
-            // detaching the node from the list.
-            let key = state.key.clone();
-
             // SAFETY: `tail` is valid and in the list.
             unsafe { self.detach(tail) };
 
             // Remove from the HashMap. This drops the `AliasableBox` and frees
             // the `State` allocation.
-            self.map.remove(&key);
+            let _state = self.map.remove(&state.key);
         }
     }
 }
