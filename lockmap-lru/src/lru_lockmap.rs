@@ -199,9 +199,11 @@ impl<K: Eq + Hash, V> LruShardInner<K, V> {
     fn try_evict(&mut self) {
         let mut cursor = self.tail;
         while self.map.len() > self.capacity && !cursor.is_null() {
-            // SAFETY: `cursor` is a valid pointer to a State in the list
-            // (maintained by push_front/detach). We read `prev` before a
-            // potential detach so we can continue traversal.
+            // SAFETY: `cursor` is guaranteed non-null by the while condition.
+            // We read `prev` before a potential detach so we can advance the
+            // cursor even after `cursor` is detached and freed. `prev` may be
+            // null (when cursor is the head), which is fine because the while
+            // condition will catch it on the next iteration.
             let prev = unsafe { *(*cursor).prev.get() };
             let state = unsafe { &*cursor };
 
