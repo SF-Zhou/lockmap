@@ -315,12 +315,8 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
     /// Each shard will have a capacity of `capacity / shard_amount` (rounded up
     /// for the first shard to absorb the remainder).
     pub fn with_capacity_and_shard_amount(capacity: usize, shard_amount: usize) -> Self {
-        let per_shard = if shard_amount == 0 {
-            capacity
-        } else {
-            // Ensure at least 1 per shard when capacity > 0
-            capacity.div_ceil(shard_amount)
-        };
+        assert!(shard_amount > 0, "shard_amount must be greater than 0");
+        let per_shard = capacity.div_ceil(shard_amount);
         let map_cap = per_shard;
         Self {
             shards: (0..shard_amount)
