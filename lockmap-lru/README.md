@@ -11,9 +11,9 @@ It provides **fine-grained per-key locking** combined with **automatic capacity-
 
 *   **Per-Key Locking**: Acquire exclusive locks for specific keys. Operations on different keys run in parallel.
 *   **Per-Shard LRU Eviction**: Each shard independently tracks access order and evicts the least recently used entries when capacity is exceeded.
-*   **Non-Blocking Eviction**: If the least recently used entry is currently locked by another thread, eviction is deferred — no blocking, no starvation.
+*   **Non-Blocking Eviction**: In-use entries are skipped during eviction; traversal continues to the next candidate, ensuring eviction always makes progress.
 *   **Intrusive Linked List**: LRU bookkeeping uses pointers embedded directly in each entry, avoiding extra allocations.
-*   **Entry API**: Ergonomic RAII guards (`LruEntryByVal`, `LruEntryByRef`) for managing locks.
+*   **Entry API**: Ergonomic RAII guard (`LruEntry`) for managing locks. The key is obtained directly from the entry's internal state, eliminating redundant copies.
 
 ## Usage
 
@@ -45,7 +45,7 @@ assert_eq!(cache.remove("key"), Some("new_value".into()));
 - The total capacity is divided evenly among shards.
 - On every access (get, insert, entry, remove, contains_key), the accessed entry is promoted to the head of its shard's LRU list.
 - When a shard's entry count exceeds its capacity (after an insert or entry creation), the least recently used entries are evicted from the tail.
-- Entries currently held by an `LruEntryByVal` or `LruEntryByRef` guard are **skipped** during eviction. They will be evicted in a future pass if they remain the least recently used.
+- Entries currently held by an `LruEntry` guard are **skipped** during eviction. Traversal continues from tail towards head, evicting any eligible entries, so eviction always makes progress even when the tail entry is held by another thread.
 
 ## License
 

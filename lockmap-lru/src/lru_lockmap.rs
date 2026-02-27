@@ -192,26 +192,33 @@ impl<K: Eq + Hash, V> LruShardInner<K, V> {
 
     /// Try to evict the least-recently-used entries until the map size is within capacity.
     ///
-    /// Entries that are currently in use (refcnt > 0) are skipped — eviction is
-    /// deferred until a future access triggers another eviction pass.
+    /// Walks from the tail (LRU end) towards the head (MRU end). Entries that
+    /// are currently in use (refcnt > 0) are **skipped** and traversal continues
+    /// to the next candidate. This ensures eviction still makes progress even
+    /// when the tail entry is held by another thread.
     fn try_evict(&mut self) {
-        while self.map.len() > self.capacity && !self.tail.is_null() {
-            let tail = self.tail;
+        let mut cursor = self.tail;
+        while self.map.len() > self.capacity && !cursor.is_null() {
+            // SAFETY: `cursor` is a valid pointer to a State in the list
+            // (maintained by push_front/detach). We read `prev` before a
+            // potential detach so we can continue traversal.
+            let prev = unsafe { *(*cursor).prev.get() };
+            let state = unsafe { &*cursor };
 
-            // SAFETY: `tail` is a valid pointer to a State in the list (maintained by push_front/detach).
-            let state = unsafe { &*tail };
             if state.flags().refcnt() > 0 {
-                // The tail entry is currently in use. Give up for now; a future
-                // access will retry eviction.
-                break;
+                // This entry is currently in use — skip it and try the next one.
+                cursor = prev;
+                continue;
             }
 
-            // SAFETY: `tail` is valid and in the list.
-            unsafe { self.detach(tail) };
+            // SAFETY: `cursor` is valid and in the list.
+            unsafe { self.detach(cursor) };
 
             // Remove from the HashMap. This drops the `AliasableBox` and frees
             // the `State` allocation.
-            let _state = self.map.remove(&state.key);
+            self.map.remove(&state.key);
+
+            cursor = prev;
         }
     }
 }
@@ -257,9 +264,9 @@ impl<K: Eq + Hash, V> LruShardMap<K, V> {
 ///   entry is promoted to the head of its shard's LRU list.
 /// - After an access that may increase the shard size, entries are evicted from
 ///   the tail of the LRU list until the shard is within capacity.
-/// - Entries with an active [`LruEntryByVal`] or [`LruEntryByRef`] guard
-///   (refcnt > 0) are **not** evicted. Eviction is deferred until a subsequent
-///   access triggers another pass.
+/// - Entries with an active [`LruEntry`] guard (refcnt > 0) are **skipped**
+///   during eviction — traversal continues to the next candidate so that
+///   eviction still makes progress even when the tail entry is held.
 ///
 /// # Examples
 ///
@@ -344,7 +351,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
 
     /// Gets exclusive access to an entry in the cache.
     ///
-    /// The returned [`LruEntryByVal`] provides exclusive access to the key and
+    /// The returned [`LruEntry`] provides exclusive access to the key and
     /// its associated value until it is dropped. Accessing the entry promotes it
     /// in the LRU list and may trigger eviction of other entries.
     ///
@@ -360,7 +367,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
     ///     entry.insert(42);
     /// }
     /// ```
-    pub fn entry(&self, key: K) -> LruEntryByVal<'_, K, V> {
+    pub fn entry(&self, key: K) -> LruEntry<'_, K, V> {
         let shard = self.shard(&key);
         let ptr: *mut State<K, V> = {
             let mut inner = shard.inner.lock().unwrap();
@@ -377,16 +384,19 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                     ptr
                 }
                 None => {
-                    let state = State::new(key.clone(), None, 1);
+                    let state = State::new(key, None, 1);
                     let ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                    inner.map.insert(key.clone(), state);
+                    // SAFETY: The key reference is valid because State owns it
+                    // and AliasableBox guarantees a stable address.
+                    let key_ref = unsafe { &(*ptr).key };
+                    inner.map.insert(key_ref.clone(), state);
                     unsafe { inner.push_front(ptr) };
                     inner.try_evict();
                     ptr
                 }
             }
         };
-        self.guard_by_val(ptr, key)
+        self.guard(ptr)
     }
 
     /// Gets exclusive access to an entry by reference.
@@ -403,7 +413,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
     ///     entry.insert(42);
     /// }
     /// ```
-    pub fn entry_by_ref<'a, 'b, Q>(&'a self, key: &'b Q) -> LruEntryByRef<'a, 'b, K, Q, V>
+    pub fn entry_by_ref<Q>(&self, key: &Q) -> LruEntry<'_, K, V>
     where
         K: Borrow<Q> + for<'c> From<&'c Q>,
         Q: Eq + Hash + ?Sized,
@@ -424,16 +434,17 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                 }
                 None => {
                     let owned_key: K = key.into();
-                    let state = State::new(owned_key.clone(), None, 1);
+                    let state = State::new(owned_key, None, 1);
                     let ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                    inner.map.insert(owned_key, state);
+                    let key_ref = unsafe { &(*ptr).key };
+                    inner.map.insert(key_ref.clone(), state);
                     unsafe { inner.push_front(ptr) };
                     inner.try_evict();
                     ptr
                 }
             }
         };
-        self.guard_by_ref(ptr, key)
+        self.guard(ptr)
     }
 
     /// Gets the value associated with the given key.
@@ -488,7 +499,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
             return value;
         }
 
-        self.guard_by_ref(ptr, key).get().clone()
+        self.guard(ptr).get().clone()
     }
 
     /// Inserts a value into the cache, returning the previous value if any.
@@ -530,9 +541,10 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                     }
                 }
                 None => {
-                    let state = State::new(key.clone(), Some(value), 0);
+                    let state = State::new(key, Some(value), 0);
                     let p = &*state as *const State<K, V> as *mut State<K, V>;
-                    inner.map.insert(key.clone(), state);
+                    let key_ref = unsafe { &(*p).key };
+                    inner.map.insert(key_ref.clone(), state);
                     unsafe { inner.push_front(p) };
                     inner.try_evict();
                     (std::ptr::null_mut(), None)
@@ -544,7 +556,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
             return old;
         }
 
-        self.guard_by_val(ptr, key).swap(old)
+        self.guard(ptr).swap(old)
     }
 
     /// Inserts a value by reference key.
@@ -590,9 +602,10 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                 }
                 None => {
                     let owned_key: K = key.into();
-                    let state = State::new(owned_key.clone(), Some(value), 0);
+                    let state = State::new(owned_key, Some(value), 0);
                     let p = &*state as *const State<K, V> as *mut State<K, V>;
-                    inner.map.insert(owned_key, state);
+                    let key_ref = unsafe { &(*p).key };
+                    inner.map.insert(key_ref.clone(), state);
                     unsafe { inner.push_front(p) };
                     inner.try_evict();
                     (std::ptr::null_mut(), None)
@@ -604,7 +617,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
             return old;
         }
 
-        self.guard_by_ref(ptr, key).swap(old)
+        self.guard(ptr).swap(old)
     }
 
     /// Returns `true` if the cache contains the given key.
@@ -657,7 +670,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
             return found;
         }
 
-        self.guard_by_ref(ptr, key).get().is_some()
+        self.guard(ptr).get().is_some()
     }
 
     /// Removes a key from the cache, returning the value if it existed.
@@ -710,7 +723,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
             return value;
         }
 
-        self.guard_by_ref(ptr, key).remove()
+        self.guard(ptr).remove()
     }
 
     // ------------------------------------------------------------------
@@ -734,29 +747,11 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
         }
     }
 
-    fn guard_by_val(&self, ptr: *mut State<K, V>, key: K) -> LruEntryByVal<'_, K, V> {
+    fn guard(&self, ptr: *mut State<K, V>) -> LruEntry<'_, K, V> {
         // SAFETY: ptr is valid (ref-counted) and stable (AliasableBox).
         unsafe { (*ptr).mutex.lock() };
-        LruEntryByVal {
+        LruEntry {
             map: self,
-            key,
-            state: ptr,
-        }
-    }
-
-    fn guard_by_ref<'a, 'b, Q>(
-        &'a self,
-        ptr: *mut State<K, V>,
-        key: &'b Q,
-    ) -> LruEntryByRef<'a, 'b, K, Q, V>
-    where
-        K: Borrow<Q>,
-        Q: Eq + Hash + ?Sized,
-    {
-        unsafe { (*ptr).mutex.lock() };
-        LruEntryByRef {
-            map: self,
-            key,
             state: ptr,
         }
     }
@@ -775,27 +770,31 @@ impl<K, V> std::fmt::Debug for LruLockMap<K, V> {
 }
 
 // ---------------------------------------------------------------------------
-// LruEntryByVal
+// LruEntry
 // ---------------------------------------------------------------------------
 
 /// An RAII guard providing exclusive access to a key-value pair in the [`LruLockMap`].
 ///
+/// The key is obtained directly from the internal `State`, so there is no need
+/// for separate by-value / by-reference entry types.
+///
 /// When dropped, this type automatically unlocks the entry and may trigger
 /// cleanup of empty entries.
-pub struct LruEntryByVal<'a, K: Eq + Hash + Clone, V> {
+pub struct LruEntry<'a, K: Eq + Hash + Clone, V> {
     map: &'a LruLockMap<K, V>,
-    key: K,
     state: *mut State<K, V>,
 }
 
 // SAFETY: The guard holds a per-key mutex lock and a valid, ref-counted pointer.
-unsafe impl<K: Eq + Hash + Clone + Send, V: Send> Send for LruEntryByVal<'_, K, V> {}
-unsafe impl<K: Eq + Hash + Clone + Send + Sync, V: Send + Sync> Sync for LruEntryByVal<'_, K, V> {}
+unsafe impl<K: Eq + Hash + Clone + Send, V: Send> Send for LruEntry<'_, K, V> {}
+unsafe impl<K: Eq + Hash + Clone + Send + Sync, V: Send + Sync> Sync for LruEntry<'_, K, V> {}
 
-impl<K: Eq + Hash + Clone, V> LruEntryByVal<'_, K, V> {
+impl<K: Eq + Hash + Clone, V> LruEntry<'_, K, V> {
     /// Returns a reference to the entry's key.
     pub fn key(&self) -> &K {
-        &self.key
+        // SAFETY: The state pointer is valid for the lifetime of this guard
+        // and the key is immutable.
+        unsafe { &(*self.state).key }
     }
 
     /// Returns a reference to the entry's value.
@@ -826,110 +825,31 @@ impl<K: Eq + Hash + Clone, V> LruEntryByVal<'_, K, V> {
 }
 
 impl<K: Eq + Hash + Clone + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug
-    for LruEntryByVal<'_, K, V>
+    for LruEntry<'_, K, V>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LruEntryByVal")
-            .field("key", &self.key)
+        f.debug_struct("LruEntry")
+            .field("key", self.key())
             .field("value", self.get())
             .finish()
     }
 }
 
-impl<K: Eq + Hash + Clone, V> Drop for LruEntryByVal<'_, K, V> {
+impl<K: Eq + Hash + Clone, V> Drop for LruEntry<'_, K, V> {
     fn drop(&mut self) {
-        unsafe { &*self.state }.set_value_state(self.get().is_some());
+        let has_value = self.get().is_some();
+        // Clone the key while we still hold the per-key mutex, so we can use
+        // it for cleanup after the state's reference count reaches zero.
+        // This is necessary because once `dec_ref` makes the refcnt zero,
+        // another thread's `try_evict` could free the state.
+        let key = self.key().clone();
+
+        unsafe { &*self.state }.set_value_state(has_value);
         unsafe { &*self.state }.mutex.unlock();
 
         let flags = unsafe { (*self.state).dec_ref() };
         if flags.pending_cleanup() {
-            self.map.try_remove_entry(&self.key);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// LruEntryByRef
-// ---------------------------------------------------------------------------
-
-/// An RAII guard providing exclusive access to a key-value pair in the [`LruLockMap`],
-/// using a borrowed key reference.
-pub struct LruEntryByRef<'a, 'b, K: Eq + Hash + Clone + Borrow<Q>, Q: Eq + Hash + ?Sized, V> {
-    map: &'a LruLockMap<K, V>,
-    key: &'b Q,
-    state: *mut State<K, V>,
-}
-
-// SAFETY: Same as LruEntryByVal.
-unsafe impl<K: Eq + Hash + Clone + Borrow<Q> + Send, Q: Eq + Hash + ?Sized + Sync, V: Send> Send
-    for LruEntryByRef<'_, '_, K, Q, V>
-{
-}
-unsafe impl<
-        K: Eq + Hash + Clone + Borrow<Q> + Send + Sync,
-        Q: Eq + Hash + ?Sized + Sync,
-        V: Send + Sync,
-    > Sync for LruEntryByRef<'_, '_, K, Q, V>
-{
-}
-
-impl<K: Eq + Hash + Clone + Borrow<Q>, Q: Eq + Hash + ?Sized, V> LruEntryByRef<'_, '_, K, Q, V> {
-    /// Returns a reference to the entry's key.
-    pub fn key(&self) -> &Q {
-        self.key
-    }
-
-    /// Returns a reference to the entry's value.
-    pub fn get(&self) -> &Option<V> {
-        unsafe { (*self.state).value_ref() }
-    }
-
-    /// Returns a mutable reference to the entry's value.
-    pub fn get_mut(&mut self) -> &mut Option<V> {
-        unsafe { (*self.state).value_mut() }
-    }
-
-    /// Sets the value, returning the old value if any.
-    pub fn insert(&mut self, value: V) -> Option<V> {
-        self.get_mut().replace(value)
-    }
-
-    /// Swaps the value with the provided one, returning the old value.
-    pub fn swap(&mut self, mut value: Option<V>) -> Option<V> {
-        std::mem::swap(self.get_mut(), &mut value);
-        value
-    }
-
-    /// Removes the value, returning it if it existed.
-    pub fn remove(&mut self) -> Option<V> {
-        self.get_mut().take()
-    }
-}
-
-impl<K, Q, V> std::fmt::Debug for LruEntryByRef<'_, '_, K, Q, V>
-where
-    K: Eq + Hash + Clone + Borrow<Q> + std::fmt::Debug,
-    Q: Eq + Hash + ?Sized + std::fmt::Debug,
-    V: std::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LruEntryByRef")
-            .field("key", &self.key)
-            .field("value", self.get())
-            .finish()
-    }
-}
-
-impl<K: Eq + Hash + Clone + Borrow<Q>, Q: Eq + Hash + ?Sized, V> Drop
-    for LruEntryByRef<'_, '_, K, Q, V>
-{
-    fn drop(&mut self) {
-        unsafe { &*self.state }.set_value_state(self.get().is_some());
-        unsafe { &*self.state }.mutex.unlock();
-
-        let flags = unsafe { (*self.state).dec_ref() };
-        if flags.pending_cleanup() {
-            self.map.try_remove_entry(self.key);
+            self.map.try_remove_entry(&key);
         }
     }
 }
@@ -1100,8 +1020,8 @@ mod tests {
         // Hold entry for key=1 (the LRU tail after inserting 2 and 3)
         let _entry = cache.entry(1);
 
-        // Insert key=4 — should try to evict key=1 but it's in use, so skip
-        // The cache may grow beyond capacity temporarily.
+        // Insert key=4 — should try to evict key=1 but it's in use.
+        // With the improved eviction, it skips key=1 and evicts key=2 instead.
         let cache2 = cache.clone();
         let t = std::thread::spawn(move || {
             cache2.insert(4, 40);
@@ -1111,11 +1031,48 @@ mod tests {
         // key=1 should still be present because it was in use
         assert_eq!(*_entry.get(), Some(10));
 
-        // After dropping the entry, cleanup may happen on next access
-        drop(_entry);
+        // key=2 should have been evicted (it was the next LRU candidate)
+        assert_eq!(cache.get(&2), None);
 
-        // The cache may now have 4 items but future inserts will evict
+        // key=3 and key=4 should still be present
+        assert_eq!(cache.get(&3), Some(30));
+        assert_eq!(cache.get(&4), Some(40));
+
+        // After dropping the held entry, cache should be within capacity
+        drop(_entry);
         assert!(cache.len() <= 4);
+    }
+
+    #[test]
+    fn test_lru_evict_skips_multiple_in_use() {
+        // Verify that eviction walks past multiple in-use entries and still
+        // evicts other eligible entries.
+        let cache = LruLockMap::<u32, u32>::with_capacity_and_shard_amount(3, 1);
+
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        cache.insert(3, 30);
+
+        // Hold the two LRU-most entries (key=1 is tail, key=2 is next)
+        let _entry1 = cache.entry(1);
+        let _entry2 = cache.entry(2);
+
+        // Insert key=4 from a separate thread (since entry() would deadlock
+        // on same thread for key=1 or key=2, but key=4 is new).
+        // The eviction should skip key=1 and key=2 (both in use), evict key=3.
+        cache.insert(4, 40);
+
+        // key=1, key=2 still present (in use)
+        assert_eq!(*_entry1.get(), Some(10));
+        assert_eq!(*_entry2.get(), Some(20));
+
+        // key=3 evicted, key=4 present
+        // Note: we use contains_key via a thread since entry() would interact with LRU
+        assert_eq!(cache.get(&3), None);
+        assert_eq!(cache.get(&4), Some(40));
+
+        drop(_entry2);
+        drop(_entry1);
     }
 
     #[test]

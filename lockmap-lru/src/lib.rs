@@ -9,14 +9,15 @@
 //! Each shard maintains its own LRU list using an intrusive doubly-linked list
 //! embedded in the entry state. On every access, the accessed entry is promoted
 //! to the head of the list. When a shard exceeds its capacity, the least recently
-//! used entries are evicted from the tail — unless they are currently locked by
-//! another thread, in which case eviction is deferred.
+//! used entries are evicted from the tail. In-use entries (held by an [`LruEntry`]
+//! guard) are skipped and eviction continues to the next candidate, ensuring
+//! progress even when the tail entry is held by another thread.
 //!
 //! # Features
 //!
 //! - **Per-key locking**: Same fine-grained locking as `lockmap`
 //! - **Per-shard LRU eviction**: Each shard independently manages its own LRU list
-//! - **Non-blocking eviction**: Entries currently in use are skipped during eviction
+//! - **Non-blocking eviction**: Entries currently in use are skipped; eviction walks past them to evict other candidates
 //! - **Intrusive linked list**: Zero-allocation LRU bookkeeping via pointers embedded in each entry
 //!
 //! # Examples
