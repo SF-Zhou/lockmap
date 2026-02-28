@@ -8,8 +8,12 @@
 //!
 //! Each shard maintains its own LRU list using an intrusive doubly-linked list
 //! embedded in the entry state. The underlying storage uses
-//! [`hashbrown::HashTable`] to avoid key duplication — the key lives only inside
-//! the `State` node, and lookups provide a hash + equality closure.
+//! [`hashbrown::HashTable`] to avoid key duplication — the key and its
+//! pre-computed hash live only inside the `State` node.  A single `RandomState`
+//! hasher is shared across all shards: high bits of the hash select the shard,
+//! and the full hash is passed to the `HashTable`, eliminating redundant hashing.
+//! Lookups use `HashTable::entry` / `HashTable::find_entry` for single-probe
+//! find-or-insert / find-or-remove, avoiding double lookups.
 //!
 //! On every access, the accessed entry is promoted to the head of the list.
 //! When a shard exceeds its capacity, the least recently used entries are evicted
@@ -24,6 +28,7 @@
 //! - **Non-blocking eviction**: Entries currently in use are skipped; eviction walks past them to evict other candidates
 //! - **Intrusive linked list**: Zero-allocation LRU bookkeeping via pointers embedded in each entry
 //! - **No key duplication**: Uses `hashbrown::HashTable` so the key is stored only once, inside the entry state
+//! - **Single hash**: One `RandomState` hasher for the entire map; hash computed once per operation
 //!
 //! # Examples
 //!
