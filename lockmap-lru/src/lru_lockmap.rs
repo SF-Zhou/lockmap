@@ -386,12 +386,10 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                     ptr
                 }
                 None => {
+                    let key_clone = key.clone();
                     let state = State::new(key, None, 1);
                     let ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                    // SAFETY: The key reference is valid because State owns it
-                    // and AliasableBox guarantees a stable address.
-                    let key_ref = unsafe { &(*ptr).key };
-                    inner.map.insert(key_ref.clone(), state);
+                    inner.map.insert(key_clone, state);
                     unsafe { inner.push_front(ptr) };
                     inner.try_evict();
                     ptr
@@ -436,10 +434,10 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                 }
                 None => {
                     let owned_key: K = key.into();
+                    let key_clone = owned_key.clone();
                     let state = State::new(owned_key, None, 1);
                     let ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                    let key_ref = unsafe { &(*ptr).key };
-                    inner.map.insert(key_ref.clone(), state);
+                    inner.map.insert(key_clone, state);
                     unsafe { inner.push_front(ptr) };
                     inner.try_evict();
                     ptr
@@ -543,10 +541,10 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                     }
                 }
                 None => {
+                    let key_clone = key.clone();
                     let state = State::new(key, Some(value), 0);
                     let p = &*state as *const State<K, V> as *mut State<K, V>;
-                    let key_ref = unsafe { &(*p).key };
-                    inner.map.insert(key_ref.clone(), state);
+                    inner.map.insert(key_clone, state);
                     unsafe { inner.push_front(p) };
                     inner.try_evict();
                     (std::ptr::null_mut(), None)
@@ -604,10 +602,10 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                 }
                 None => {
                     let owned_key: K = key.into();
+                    let key_clone = owned_key.clone();
                     let state = State::new(owned_key, Some(value), 0);
                     let p = &*state as *const State<K, V> as *mut State<K, V>;
-                    let key_ref = unsafe { &(*p).key };
-                    inner.map.insert(key_ref.clone(), state);
+                    inner.map.insert(key_clone, state);
                     unsafe { inner.push_front(p) };
                     inner.try_evict();
                     (std::ptr::null_mut(), None)
