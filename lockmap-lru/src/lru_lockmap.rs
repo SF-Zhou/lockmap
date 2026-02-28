@@ -1515,6 +1515,40 @@ mod tests {
     }
 
     #[test]
+    fn test_lockmap_insert_remove() {
+        let lock_map = Arc::new(LruLockMap::<String, u32>::with_options(1 << 20, 16, 1));
+        #[cfg(not(miri))]
+        const N: usize = 1 << 22;
+        #[cfg(miri)]
+        const N: usize = 1 << 6;
+
+        let entry_thread = {
+            let lock_map = lock_map.clone();
+            std::thread::spawn(move || {
+                for _ in 0..N {
+                    let key = (rand::random::<u32>() % 32).to_string();
+                    let mut entry = lock_map.entry_by_ref(&key);
+                    entry.remove();
+                }
+            })
+        };
+
+        let set_thread = {
+            let lock_map = lock_map.clone();
+            std::thread::spawn(move || {
+                for _ in 0..N {
+                    let key = (rand::random::<u32>() % 32).to_string();
+                    let value = rand::random::<u32>() % 32;
+                    lock_map.insert_by_ref(&key, value);
+                }
+            })
+        };
+
+        entry_thread.join().unwrap();
+        set_thread.join().unwrap();
+    }
+
+    #[test]
     fn test_lockmap_heavy_contention() {
         let lock_map = Arc::new(LruLockMap::<u32, u32>::new(1 << 20));
         #[cfg(not(miri))]
