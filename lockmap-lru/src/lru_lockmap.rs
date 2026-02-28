@@ -531,9 +531,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                     if flags.refcnt() == 0 {
                         // SAFETY: refcnt == 0 → exclusive.
                         let old = unsafe { state.value_mut() }.replace(value);
-                        if !flags.has_value() {
-                            state.set_value_state(true);
-                        }
+                        state.set_value_state(true);
                         (std::ptr::null_mut(), old)
                     } else {
                         state.inc_ref();
@@ -591,9 +589,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                     let flags = state.flags();
                     if flags.refcnt() == 0 {
                         let old = unsafe { state.value_mut() }.replace(value);
-                        if !flags.has_value() {
-                            state.set_value_state(true);
-                        }
+                        state.set_value_state(true);
                         (std::ptr::null_mut(), old)
                     } else {
                         state.inc_ref();
