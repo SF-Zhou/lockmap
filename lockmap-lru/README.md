@@ -13,6 +13,7 @@ It provides **fine-grained per-key locking** combined with **automatic capacity-
 *   **Per-Shard LRU Eviction**: Each shard independently tracks access order and evicts the least recently used entries when capacity is exceeded.
 *   **Non-Blocking Eviction**: In-use entries are skipped during eviction; traversal continues to the next candidate, ensuring eviction always makes progress.
 *   **Intrusive Linked List**: LRU bookkeeping uses pointers embedded directly in each entry, avoiding extra allocations.
+*   **No Key Duplication**: Uses `hashbrown::HashTable` so each key is stored only once (inside the entry state), saving memory and avoiding extra clones.
 *   **Entry API**: Ergonomic RAII guard (`LruEntry`) for managing locks. The key is obtained directly from the entry's internal state, eliminating redundant copies.
 
 ## Usage

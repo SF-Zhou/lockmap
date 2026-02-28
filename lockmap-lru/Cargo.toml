@@ -12,6 +12,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 aliasable.workspace = true
 foldhash.workspace = true
+hashbrown.workspace = true
 lockmap-core = { version = "0.1.0", path = "../lockmap-core" }
 
 [dev-dependencies]

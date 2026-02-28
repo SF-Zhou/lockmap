@@ -1,9 +1,9 @@
 use aliasable::boxed::AliasableBox;
 use foldhash::fast::RandomState;
+use hashbrown::HashTable;
 use lockmap_core::Mutex;
 use std::borrow::Borrow;
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
@@ -105,11 +105,18 @@ impl<K, V> State<K, V> {
 }
 
 // ---------------------------------------------------------------------------
-// LruShardInner – HashMap + intrusive doubly-linked LRU list
+// LruShardInner – HashTable + intrusive doubly-linked LRU list
+//
+// Uses `hashbrown::HashTable<AliasableBox<State<K, V>>>` instead of
+// `HashMap<K, AliasableBox<State<K, V>>>`.  Because the key already lives
+// inside `State`, there is no need to store a separate copy as the HashMap
+// key.  All lookups provide a hash value and an equality closure that
+// compares against `state.key`.
 // ---------------------------------------------------------------------------
 
 struct LruShardInner<K, V> {
-    map: HashMap<K, AliasableBox<State<K, V>>, RandomState>,
+    table: HashTable<AliasableBox<State<K, V>>>,
+    hasher: RandomState,
     head: *mut State<K, V>,
     tail: *mut State<K, V>,
     max_size: usize,
@@ -122,10 +129,70 @@ unsafe impl<K: Send, V: Send> Send for LruShardInner<K, V> {}
 impl<K: Eq + Hash, V> LruShardInner<K, V> {
     fn with_capacity(max_size: usize, capacity: usize) -> Self {
         Self {
-            map: HashMap::with_capacity_and_hasher(capacity, RandomState::default()),
+            table: HashTable::with_capacity(capacity),
+            hasher: RandomState::default(),
             head: std::ptr::null_mut(),
             tail: std::ptr::null_mut(),
             max_size,
+        }
+    }
+
+    /// Compute the hash of a key using the shard-local hasher.
+    #[inline(always)]
+    fn hash_key<Q>(&self, key: &Q) -> u64
+    where
+        K: Borrow<Q>,
+        Q: Hash + ?Sized,
+    {
+        self.hasher.hash_one(key)
+    }
+
+    /// Equality closure that compares a table entry's key against `key`.
+    #[inline(always)]
+    fn eq_fn<'a, Q>(key: &'a Q) -> impl Fn(&AliasableBox<State<K, V>>) -> bool + 'a
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        move |state| state.key.borrow() == key
+    }
+
+    /// Find a state by key, returning a raw pointer (or null if not found).
+    fn find_ptr<Q>(&self, key: &Q) -> *mut State<K, V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        let hash = self.hash_key(key);
+        self.table
+            .find(hash, Self::eq_fn(key))
+            .map(|s| &**s as *const State<K, V> as *mut State<K, V>)
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Insert a new state into the table.  The state's key must not already
+    /// exist in the table.
+    fn insert_state(&mut self, state: AliasableBox<State<K, V>>) {
+        let hash = self.hasher.hash_one(&state.key);
+        let hasher = &self.hasher;
+        self.table
+            .insert_unique(hash, state, |s| hasher.hash_one(&s.key));
+    }
+
+    /// Remove the entry whose key matches `key`.  Returns the removed
+    /// `AliasableBox` (dropping it frees the `State`).
+    fn remove_state<Q>(&mut self, key: &Q) -> Option<AliasableBox<State<K, V>>>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        let hash = self.hash_key(key);
+        match self.table.find_entry(hash, Self::eq_fn(key)) {
+            Ok(entry) => {
+                let (state, _) = entry.remove();
+                Some(state)
+            }
+            Err(_) => None,
         }
     }
 
@@ -190,7 +257,7 @@ impl<K: Eq + Hash, V> LruShardInner<K, V> {
         self.push_front(node);
     }
 
-    /// Try to evict the least-recently-used entries until the map size is within capacity.
+    /// Try to evict the least-recently-used entries until the table size is within capacity.
     ///
     /// Walks from the tail (LRU end) towards the head (MRU end). Entries that
     /// are currently in use (refcnt > 0) are **skipped** and traversal continues
@@ -198,7 +265,7 @@ impl<K: Eq + Hash, V> LruShardInner<K, V> {
     /// when the tail entry is held by another thread.
     fn try_evict(&mut self, current: *mut State<K, V>) {
         let mut cursor = self.tail;
-        while self.map.len() > self.max_size && !cursor.is_null() && cursor != current {
+        while self.table.len() > self.max_size && !cursor.is_null() && cursor != current {
             // SAFETY: `cursor` is guaranteed non-null by the while condition.
             // We read `prev` before a potential detach so we can advance the
             // cursor even after `cursor` is detached and freed. `prev` may be
@@ -216,9 +283,9 @@ impl<K: Eq + Hash, V> LruShardInner<K, V> {
             // SAFETY: `cursor` is valid and in the list.
             unsafe { self.detach(cursor) };
 
-            // Remove from the HashMap. This drops the `AliasableBox` and frees
-            // the `State` allocation.
-            let _state = self.map.remove(&state.key);
+            // Remove from the HashTable. This drops the `AliasableBox` and
+            // frees the `State` allocation.
+            let _state = self.remove_state(&state.key);
 
             cursor = prev;
         }
@@ -241,11 +308,11 @@ impl<K: Eq + Hash, V> LruShardMap<K, V> {
     }
 
     fn len(&self) -> usize {
-        self.inner.lock().unwrap().map.len()
+        self.inner.lock().unwrap().table.len()
     }
 
     fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().map.is_empty()
+        self.inner.lock().unwrap().table.is_empty()
     }
 }
 
@@ -373,27 +440,20 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
         let shard = self.shard(&key);
         let ptr: *mut State<K, V> = {
             let mut inner = shard.inner.lock().unwrap();
-            let p = inner
-                .map
-                .get(&key)
-                .map(|s| &**s as *const State<K, V> as *mut State<K, V>);
-            match p {
-                Some(ptr) => {
-                    // SAFETY: ptr is valid and ref-counted via AliasableBox.
-                    unsafe { &*ptr }.inc_ref();
-                    unsafe { inner.move_to_front(ptr) };
-                    inner.try_evict(ptr);
-                    ptr
-                }
-                None => {
-                    let key_clone = key.clone();
-                    let state = State::new(key, None, 1);
-                    let ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                    inner.map.insert(key_clone, state);
-                    unsafe { inner.push_front(ptr) };
-                    inner.try_evict(ptr);
-                    ptr
-                }
+            let p = inner.find_ptr(&key);
+            if !p.is_null() {
+                // SAFETY: ptr is valid and ref-counted via AliasableBox.
+                unsafe { &*p }.inc_ref();
+                unsafe { inner.move_to_front(p) };
+                inner.try_evict(p);
+                p
+            } else {
+                let state = State::new(key, None, 1);
+                let ptr = &*state as *const State<K, V> as *mut State<K, V>;
+                inner.insert_state(state);
+                unsafe { inner.push_front(ptr) };
+                inner.try_evict(ptr);
+                ptr
             }
         };
         self.guard(ptr)
@@ -421,27 +481,20 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
         let shard = self.shard(key);
         let ptr: *mut State<K, V> = {
             let mut inner = shard.inner.lock().unwrap();
-            let p = inner
-                .map
-                .get(key)
-                .map(|s| &**s as *const State<K, V> as *mut State<K, V>);
-            match p {
-                Some(ptr) => {
-                    unsafe { &*ptr }.inc_ref();
-                    unsafe { inner.move_to_front(ptr) };
-                    inner.try_evict(ptr);
-                    ptr
-                }
-                None => {
-                    let owned_key: K = key.into();
-                    let key_clone = owned_key.clone();
-                    let state = State::new(owned_key, None, 1);
-                    let ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                    inner.map.insert(key_clone, state);
-                    unsafe { inner.push_front(ptr) };
-                    inner.try_evict(ptr);
-                    ptr
-                }
+            let p = inner.find_ptr(key);
+            if !p.is_null() {
+                unsafe { &*p }.inc_ref();
+                unsafe { inner.move_to_front(p) };
+                inner.try_evict(p);
+                p
+            } else {
+                let owned_key: K = key.into();
+                let state = State::new(owned_key, None, 1);
+                let ptr = &*state as *const State<K, V> as *mut State<K, V>;
+                inner.insert_state(state);
+                unsafe { inner.push_front(ptr) };
+                inner.try_evict(ptr);
+                ptr
             }
         };
         self.guard(ptr)
@@ -473,25 +526,21 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
 
         let value = {
             let mut inner = shard.inner.lock().unwrap();
-            let p = inner
-                .map
-                .get(key)
-                .map(|s| &**s as *const State<K, V> as *mut State<K, V>);
-            match p {
-                Some(p) => {
-                    unsafe { inner.move_to_front(p) };
+            let p = inner.find_ptr(key);
+            if !p.is_null() {
+                unsafe { inner.move_to_front(p) };
 
-                    let state = unsafe { &*p };
-                    if state.flags().refcnt() == 0 {
-                        // SAFETY: refcnt == 0 means no Entry guard exists.
-                        unsafe { state.value_ref() }.clone()
-                    } else {
-                        state.inc_ref();
-                        ptr = p;
-                        None
-                    }
+                let state = unsafe { &*p };
+                if state.flags().refcnt() == 0 {
+                    // SAFETY: refcnt == 0 means no Entry guard exists.
+                    unsafe { state.value_ref() }.clone()
+                } else {
+                    state.inc_ref();
+                    ptr = p;
+                    None
                 }
-                None => None,
+            } else {
+                None
             }
         };
 
@@ -518,35 +567,28 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
         let shard = self.shard(&key);
         let (ptr, old) = {
             let mut inner = shard.inner.lock().unwrap();
-            let p = inner
-                .map
-                .get(&key)
-                .map(|s| &**s as *const State<K, V> as *mut State<K, V>);
-            match p {
-                Some(p) => {
-                    unsafe { inner.move_to_front(p) };
+            let p = inner.find_ptr(&key);
+            if !p.is_null() {
+                unsafe { inner.move_to_front(p) };
 
-                    let state = unsafe { &*p };
-                    let flags = state.flags();
-                    if flags.refcnt() == 0 {
-                        // SAFETY: refcnt == 0 → exclusive.
-                        let old = unsafe { state.value_mut() }.replace(value);
-                        state.set_value_state(true);
-                        (std::ptr::null_mut(), old)
-                    } else {
-                        state.inc_ref();
-                        (p, Some(value))
-                    }
+                let state = unsafe { &*p };
+                let flags = state.flags();
+                if flags.refcnt() == 0 {
+                    // SAFETY: refcnt == 0 → exclusive.
+                    let old = unsafe { state.value_mut() }.replace(value);
+                    state.set_value_state(true);
+                    (std::ptr::null_mut(), old)
+                } else {
+                    state.inc_ref();
+                    (p, Some(value))
                 }
-                None => {
-                    let key_clone = key.clone();
-                    let state = State::new(key, Some(value), 0);
-                    let ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                    inner.map.insert(key_clone, state);
-                    unsafe { inner.push_front(ptr) };
-                    inner.try_evict(ptr);
-                    (std::ptr::null_mut(), None)
-                }
+            } else {
+                let state = State::new(key, Some(value), 0);
+                let ptr = &*state as *const State<K, V> as *mut State<K, V>;
+                inner.insert_state(state);
+                unsafe { inner.push_front(ptr) };
+                inner.try_evict(ptr);
+                (std::ptr::null_mut(), None)
             }
         };
 
@@ -577,35 +619,28 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
         let shard = self.shard(key);
         let (ptr, old) = {
             let mut inner = shard.inner.lock().unwrap();
-            let p = inner
-                .map
-                .get(key)
-                .map(|s| &**s as *const State<K, V> as *mut State<K, V>);
-            match p {
-                Some(p) => {
-                    unsafe { inner.move_to_front(p) };
+            let p = inner.find_ptr(key);
+            if !p.is_null() {
+                unsafe { inner.move_to_front(p) };
 
-                    let state = unsafe { &*p };
-                    let flags = state.flags();
-                    if flags.refcnt() == 0 {
-                        let old = unsafe { state.value_mut() }.replace(value);
-                        state.set_value_state(true);
-                        (std::ptr::null_mut(), old)
-                    } else {
-                        state.inc_ref();
-                        (p, Some(value))
-                    }
+                let state = unsafe { &*p };
+                let flags = state.flags();
+                if flags.refcnt() == 0 {
+                    let old = unsafe { state.value_mut() }.replace(value);
+                    state.set_value_state(true);
+                    (std::ptr::null_mut(), old)
+                } else {
+                    state.inc_ref();
+                    (p, Some(value))
                 }
-                None => {
-                    let owned_key: K = key.into();
-                    let key_clone = owned_key.clone();
-                    let state = State::new(owned_key, Some(value), 0);
-                    let ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                    inner.map.insert(key_clone, state);
-                    unsafe { inner.push_front(ptr) };
-                    inner.try_evict(ptr);
-                    (std::ptr::null_mut(), None)
-                }
+            } else {
+                let owned_key: K = key.into();
+                let state = State::new(owned_key, Some(value), 0);
+                let ptr = &*state as *const State<K, V> as *mut State<K, V>;
+                inner.insert_state(state);
+                unsafe { inner.push_front(ptr) };
+                inner.try_evict(ptr);
+                (std::ptr::null_mut(), None)
             }
         };
 
@@ -641,24 +676,20 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
 
         let found = {
             let mut inner = shard.inner.lock().unwrap();
-            let p = inner
-                .map
-                .get(key)
-                .map(|s| &**s as *const State<K, V> as *mut State<K, V>);
-            match p {
-                Some(p) => {
-                    unsafe { inner.move_to_front(p) };
+            let p = inner.find_ptr(key);
+            if !p.is_null() {
+                unsafe { inner.move_to_front(p) };
 
-                    let state = unsafe { &*p };
-                    if state.flags().refcnt() == 0 {
-                        unsafe { state.value_ref() }.is_some()
-                    } else {
-                        state.inc_ref();
-                        ptr = p;
-                        false
-                    }
+                let state = unsafe { &*p };
+                if state.flags().refcnt() == 0 {
+                    unsafe { state.value_ref() }.is_some()
+                } else {
+                    state.inc_ref();
+                    ptr = p;
+                    false
                 }
-                None => false,
+            } else {
+                false
             }
         };
 
@@ -692,26 +723,22 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
 
         let value = {
             let mut inner = shard.inner.lock().unwrap();
-            let p = inner
-                .map
-                .get(key)
-                .map(|s| &**s as *const State<K, V> as *mut State<K, V>);
-            match p {
-                Some(p) => {
-                    let state = unsafe { &*p };
-                    if state.flags().refcnt() == 0 {
-                        // SAFETY: refcnt == 0 → exclusive.
-                        let value = unsafe { state.value_mut() }.take();
-                        unsafe { inner.detach(p) };
-                        inner.map.remove(key);
-                        value
-                    } else {
-                        state.inc_ref();
-                        ptr = p;
-                        None
-                    }
+            let p = inner.find_ptr(key);
+            if !p.is_null() {
+                let state = unsafe { &*p };
+                if state.flags().refcnt() == 0 {
+                    // SAFETY: refcnt == 0 → exclusive.
+                    let value = unsafe { state.value_mut() }.take();
+                    unsafe { inner.detach(p) };
+                    inner.remove_state(key);
+                    value
+                } else {
+                    state.inc_ref();
+                    ptr = p;
+                    None
                 }
-                None => None,
+            } else {
+                None
             }
         };
 
@@ -819,10 +846,10 @@ impl<K: Eq + Hash + Clone, V> Drop for LruEntry<'_, K, V> {
     ///    - If this is the last guard and the entry has no value, break and proceed to cleanup.
     ///    - If not the last guard or the entry still has a value, return early.
     ///    - Uses a CAS loop to ensure thread-safe decrement of the reference count.
-    /// 4. Acquire the corresponding shard lock to safely access and modify the LRU list and map.
+    /// 4. Acquire the corresponding shard lock to safely access and modify the LRU list and table.
     /// 5. Decrement the reference count again; if `refcnt == 0` and no value, cleanup:
     ///    - Remove the entry from the LRU list.
-    ///    - Remove the entry from the map, freeing memory.
+    ///    - Remove the entry from the table, freeing memory.
     ///
     /// # Safety
     /// - Mutex unlocking and linked list operations are performed while holding the shard lock, ensuring thread safety.
@@ -866,7 +893,7 @@ impl<K: Eq + Hash + Clone, V> Drop for LruEntry<'_, K, V> {
         if final_flags.pending_cleanup() {
             // SAFETY: The entry is in the linked list and the shard lock is held
             unsafe { inner.detach(self.state) };
-            let _state = inner.map.remove(&state_ref.key);
+            let _state = inner.remove_state(&state_ref.key);
         }
     }
 }

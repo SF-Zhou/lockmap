@@ -85,6 +85,7 @@ if let Some(mut entry) = locked_entries.get_mut("key1") {
 *   **Per-Shard LRU Eviction**: Each shard independently tracks access order and evicts least recently used entries when capacity is exceeded.
 *   **Non-Blocking Eviction**: In-use entries are skipped during eviction; traversal continues to the next candidate, ensuring progress even when the tail is held.
 *   **Intrusive Linked List**: LRU bookkeeping uses pointers embedded directly in each entry, avoiding extra allocations.
+*   **No Key Duplication**: Uses `hashbrown::HashTable` so each key is stored only once, inside the entry state.
 
 ### Usage
 

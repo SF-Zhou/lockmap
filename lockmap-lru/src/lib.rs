@@ -7,11 +7,15 @@
 //! fine-grained per-key locking with automatic capacity-based eviction.
 //!
 //! Each shard maintains its own LRU list using an intrusive doubly-linked list
-//! embedded in the entry state. On every access, the accessed entry is promoted
-//! to the head of the list. When a shard exceeds its capacity, the least recently
-//! used entries are evicted from the tail. In-use entries (held by an [`LruEntry`]
-//! guard) are skipped and eviction continues to the next candidate, ensuring
-//! progress even when the tail entry is held by another thread.
+//! embedded in the entry state. The underlying storage uses
+//! [`hashbrown::HashTable`] to avoid key duplication — the key lives only inside
+//! the `State` node, and lookups provide a hash + equality closure.
+//!
+//! On every access, the accessed entry is promoted to the head of the list.
+//! When a shard exceeds its capacity, the least recently used entries are evicted
+//! from the tail. In-use entries (held by an [`LruEntry`] guard) are skipped and
+//! eviction continues to the next candidate, ensuring progress even when the
+//! tail entry is held by another thread.
 //!
 //! # Features
 //!
@@ -19,6 +23,7 @@
 //! - **Per-shard LRU eviction**: Each shard independently manages its own LRU list
 //! - **Non-blocking eviction**: Entries currently in use are skipped; eviction walks past them to evict other candidates
 //! - **Intrusive linked list**: Zero-allocation LRU bookkeeping via pointers embedded in each entry
+//! - **No key duplication**: Uses `hashbrown::HashTable` so the key is stored only once, inside the entry state
 //!
 //! # Examples
 //!
