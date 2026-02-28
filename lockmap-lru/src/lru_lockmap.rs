@@ -112,7 +112,7 @@ struct LruShardInner<K, V> {
     map: HashMap<K, AliasableBox<State<K, V>>, RandomState>,
     head: *mut State<K, V>,
     tail: *mut State<K, V>,
-    capacity: usize,
+    max_size: usize,
 }
 
 // SAFETY: The raw pointers (head, tail, prev, next) are only accessed while
@@ -120,12 +120,12 @@ struct LruShardInner<K, V> {
 unsafe impl<K: Send, V: Send> Send for LruShardInner<K, V> {}
 
 impl<K: Eq + Hash, V> LruShardInner<K, V> {
-    fn with_capacity(map_capacity: usize, lru_capacity: usize) -> Self {
+    fn with_capacity(max_size: usize, capacity: usize) -> Self {
         Self {
-            map: HashMap::with_capacity_and_hasher(map_capacity, RandomState::default()),
+            map: HashMap::with_capacity_and_hasher(capacity, RandomState::default()),
             head: std::ptr::null_mut(),
             tail: std::ptr::null_mut(),
-            capacity: lru_capacity,
+            max_size,
         }
     }
 
@@ -198,7 +198,7 @@ impl<K: Eq + Hash, V> LruShardInner<K, V> {
     /// when the tail entry is held by another thread.
     fn try_evict(&mut self, current: *mut State<K, V>) {
         let mut cursor = self.tail;
-        while self.map.len() > self.capacity && !cursor.is_null() && cursor != current {
+        while self.map.len() > self.max_size && !cursor.is_null() && cursor != current {
             // SAFETY: `cursor` is guaranteed non-null by the while condition.
             // We read `prev` before a potential detach so we can advance the
             // cursor even after `cursor` is detached and freed. `prev` may be
@@ -234,9 +234,9 @@ struct LruShardMap<K, V> {
 }
 
 impl<K: Eq + Hash, V> LruShardMap<K, V> {
-    fn with_capacity(map_capacity: usize, lru_capacity: usize) -> Self {
+    fn with_capacity(max_size: usize, capacity: usize) -> Self {
         Self {
-            inner: std::sync::Mutex::new(LruShardInner::with_capacity(map_capacity, lru_capacity)),
+            inner: std::sync::Mutex::new(LruShardInner::with_capacity(max_size, capacity)),
         }
     }
 
@@ -305,21 +305,21 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
     /// Creates a new `LruLockMap` with the given total capacity.
     ///
     /// The capacity is divided evenly among the default number of shards.
-    pub fn new(capacity: usize) -> Self {
-        Self::with_capacity_and_shard_amount(capacity, default_shard_amount())
+    pub fn new(max_size: usize) -> Self {
+        Self::with_options(max_size, 0, default_shard_amount())
     }
 
     /// Creates a new `LruLockMap` with the given total capacity and number of shards.
     ///
     /// Each shard will have a capacity of `capacity / shard_amount` (rounded up
     /// for the first shard to absorb the remainder).
-    pub fn with_capacity_and_shard_amount(capacity: usize, shard_amount: usize) -> Self {
+    pub fn with_options(max_size: usize, initial_capacity: usize, shard_amount: usize) -> Self {
         assert!(shard_amount > 0, "shard_amount must be greater than 0");
-        let per_shard = capacity.div_ceil(shard_amount);
-        let map_cap = per_shard;
+        let per_thread_max_size = max_size.div_ceil(shard_amount);
+        let per_thread_capacity = initial_capacity.div_ceil(shard_amount);
         Self {
             shards: (0..shard_amount)
-                .map(|_| LruShardMap::with_capacity(map_cap, per_shard))
+                .map(|_| LruShardMap::with_capacity(per_thread_max_size, per_thread_capacity))
                 .collect(),
             hasher: RandomState::default(),
         }
@@ -950,8 +950,8 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_capacity() {
-        let cache = LruLockMap::<u32, u32>::with_capacity_and_shard_amount(0, 1);
+    fn test_lru_zero_capacity() {
+        let cache = LruLockMap::<u32, u32>::with_options(0, 0, 1);
         assert!(cache.is_empty());
 
         assert_eq!(cache.insert(1, 10), None);
@@ -966,7 +966,7 @@ mod tests {
     #[test]
     fn test_lru_eviction_basic() {
         // 1 shard, capacity 3
-        let cache = LruLockMap::<u32, u32>::with_capacity_and_shard_amount(3, 1);
+        let cache = LruLockMap::<u32, u32>::with_options(3, 3, 1);
 
         cache.insert(1, 10);
         cache.insert(2, 20);
@@ -985,7 +985,7 @@ mod tests {
     #[test]
     fn test_lru_access_promotes() {
         // 1 shard, capacity 3
-        let cache = LruLockMap::<u32, u32>::with_capacity_and_shard_amount(3, 1);
+        let cache = LruLockMap::<u32, u32>::with_options(3, 3, 1);
 
         cache.insert(1, 10);
         cache.insert(2, 20);
@@ -1004,7 +1004,7 @@ mod tests {
 
     #[test]
     fn test_lru_entry_promotes() {
-        let cache = LruLockMap::<u32, u32>::with_capacity_and_shard_amount(3, 1);
+        let cache = LruLockMap::<u32, u32>::with_options(3, 3, 1);
 
         cache.insert(1, 10);
         cache.insert(2, 20);
@@ -1023,7 +1023,7 @@ mod tests {
 
     #[test]
     fn test_lru_skip_in_use_entry() {
-        let cache = Arc::new(LruLockMap::<u32, u32>::with_capacity_and_shard_amount(3, 1));
+        let cache = Arc::new(LruLockMap::<u32, u32>::with_options(3, 3, 1));
 
         cache.insert(1, 10);
         cache.insert(2, 20);
@@ -1059,7 +1059,7 @@ mod tests {
     fn test_lru_evict_skips_multiple_in_use() {
         // Verify that eviction walks past multiple in-use entries and still
         // evicts other eligible entries.
-        let cache = LruLockMap::<u32, u32>::with_capacity_and_shard_amount(3, 1);
+        let cache = LruLockMap::<u32, u32>::with_options(3, 3, 1);
 
         cache.insert(1, 10);
         cache.insert(2, 20);
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[test]
     fn test_lru_insert_overwrite_no_evict() {
-        let cache = LruLockMap::<u32, u32>::with_capacity_and_shard_amount(3, 1);
+        let cache = LruLockMap::<u32, u32>::with_options(3, 3, 1);
 
         cache.insert(1, 10);
         cache.insert(2, 20);
@@ -1105,7 +1105,7 @@ mod tests {
 
     #[test]
     fn test_lru_remove_frees_slot() {
-        let cache = LruLockMap::<u32, u32>::with_capacity_and_shard_amount(3, 1);
+        let cache = LruLockMap::<u32, u32>::with_options(3, 3, 1);
 
         cache.insert(1, 10);
         cache.insert(2, 20);
@@ -1120,16 +1120,6 @@ mod tests {
         assert_eq!(cache.get(&1), Some(10));
         assert_eq!(cache.get(&3), Some(30));
         assert_eq!(cache.get(&4), Some(40));
-    }
-
-    #[test]
-    fn test_lru_zero_capacity() {
-        // With per-shard capacity of 0 (ceil division gives 0), inserts should
-        // still work but immediately evict.
-        let cache = LruLockMap::<u32, u32>::with_capacity_and_shard_amount(0, 4);
-        cache.insert(1, 10);
-        // The entry is evicted immediately after insert
-        assert_eq!(cache.get(&1), None);
     }
 
     // --- concurrency tests ---
@@ -1206,9 +1196,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_random_keys() {
-        let cache = Arc::new(LruLockMap::<u32, u32>::with_capacity_and_shard_amount(
-            256, 16,
-        ));
+        let cache = Arc::new(LruLockMap::<u32, u32>::with_options(256, 16, 1));
         let total = Arc::new(AtomicU32::default());
         #[cfg(not(miri))]
         const N: usize = 1 << 12;
@@ -1239,9 +1227,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_get_set() {
-        let cache = Arc::new(LruLockMap::<u32, u32>::with_capacity_and_shard_amount(
-            256, 16,
-        ));
+        let cache = Arc::new(LruLockMap::<u32, u32>::with_options(256, 16, 1));
         #[cfg(not(miri))]
         const N: usize = 1 << 16;
         #[cfg(miri)]
@@ -1298,9 +1284,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_get_set_by_ref() {
-        let cache = Arc::new(LruLockMap::<String, u32>::with_capacity_and_shard_amount(
-            256, 16,
-        ));
+        let cache = Arc::new(LruLockMap::<String, u32>::with_options(256, 16, 1));
         #[cfg(not(miri))]
         const N: usize = 1 << 14;
         #[cfg(miri)]
@@ -1358,9 +1342,7 @@ mod tests {
     #[test]
     fn test_concurrent_with_eviction() {
         // Small capacity to force frequent evictions under contention
-        let cache = Arc::new(LruLockMap::<u32, u32>::with_capacity_and_shard_amount(
-            32, 4,
-        ));
+        let cache = Arc::new(LruLockMap::<u32, u32>::with_options(32, 4, 1));
         #[cfg(not(miri))]
         const N: usize = 1 << 14;
         #[cfg(miri)]
@@ -1456,10 +1438,7 @@ mod tests {
 
     #[test]
     fn test_lockmap_get_set_by_ref() {
-        let lock_map = Arc::new(LruLockMap::<String, u32>::with_capacity_and_shard_amount(
-            1 << 20,
-            16,
-        ));
+        let lock_map = Arc::new(LruLockMap::<String, u32>::with_options(1 << 20, 16, 1));
         #[cfg(not(miri))]
         const N: usize = 1 << 18;
         #[cfg(miri)]
