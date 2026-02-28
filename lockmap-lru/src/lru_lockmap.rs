@@ -726,27 +726,6 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
         self.guard(ptr).remove()
     }
 
-    // ------------------------------------------------------------------
-    // Internal helpers
-    // ------------------------------------------------------------------
-
-    fn try_remove_entry<Q>(&self, key: &Q)
-    where
-        K: Borrow<Q>,
-        Q: Eq + Hash + ?Sized,
-    {
-        let shard = self.shard(key);
-        let mut inner = shard.inner.lock().unwrap();
-        if let Some(state) = inner.map.get(key) {
-            if state.flags().pending_cleanup() {
-                let p = &**state as *const State<K, V> as *mut State<K, V>;
-                // SAFETY: The state is in the linked list and the shard lock is held.
-                unsafe { inner.detach(p) };
-                inner.map.remove(key);
-            }
-        }
-    }
-
     fn guard(&self, ptr: *mut State<K, V>) -> LruEntry<'_, K, V> {
         // SAFETY: ptr is valid (ref-counted) and stable (AliasableBox).
         unsafe { (*ptr).mutex.lock() };
@@ -836,20 +815,62 @@ impl<K: Eq + Hash + Clone + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug
 }
 
 impl<K: Eq + Hash + Clone, V> Drop for LruEntry<'_, K, V> {
+    /// Drop implementation for `LruEntry`.
+    ///
+    /// 1. Update the value state flag to ensure `flags` reflects whether the value exists.
+    /// 2. Unlock the entry's mutex, allowing other threads to access this entry.
+    /// 3. Atomically decrement the reference count (`refcnt`).
+    ///    - If this is the last guard and the entry has no value, break and proceed to cleanup.
+    ///    - If not the last guard or the entry still has a value, return early.
+    ///    - Uses a CAS loop to ensure thread-safe decrement of the reference count.
+    /// 4. Acquire the corresponding shard lock to safely access and modify the LRU list and map.
+    /// 5. Decrement the reference count again; if `refcnt == 0` and no value, cleanup:
+    ///    - Remove the entry from the LRU list.
+    ///    - Remove the entry from the map, freeing memory.
+    ///
+    /// # Safety
+    /// - Mutex unlocking and linked list operations are performed while holding the shard lock, ensuring thread safety.
     fn drop(&mut self) {
+        // 1. Update value state flag
         let has_value = self.get().is_some();
-        // Clone the key while we still hold the per-key mutex, so we can use
-        // it for cleanup after the state's reference count reaches zero.
-        // This is necessary because once `dec_ref` makes the refcnt zero,
-        // another thread's `try_evict` could free the state.
-        let key = self.key().clone();
+        let state_ref = unsafe { &*self.state };
+        state_ref.set_value_state(has_value);
 
-        unsafe { &*self.state }.set_value_state(has_value);
-        unsafe { &*self.state }.mutex.unlock();
+        // 2. Unlock the entry's mutex
+        state_ref.mutex.unlock();
 
-        let flags = unsafe { (*self.state).dec_ref() };
-        if flags.pending_cleanup() {
-            self.map.try_remove_entry(&key);
+        // 3. CAS loop to decrement reference count
+        let mut current = state_ref.flags.load(Ordering::Acquire);
+        loop {
+            let flags = StateFlags(current);
+
+            // If this is the last guard and no value, proceed to cleanup
+            if flags.refcnt() == 1 && !flags.has_value() {
+                break;
+            }
+
+            let new_flags = StateFlags::new(flags.refcnt() - 1, flags.has_value());
+            match state_ref.flags.compare_exchange_weak(
+                current,
+                new_flags.0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return, // Not last guard or still has value, return early
+                Err(actual) => current = actual,
+            }
+        }
+
+        // 4. Acquire shard lock
+        let shard = self.map.shard(&state_ref.key);
+        let mut inner = shard.inner.lock().unwrap();
+
+        // 5. Decrement reference count again; cleanup if needed
+        let final_flags = state_ref.dec_ref();
+        if final_flags.pending_cleanup() {
+            // SAFETY: The entry is in the linked list and the shard lock is held
+            unsafe { inner.detach(self.state) };
+            let _state = inner.map.remove(&state_ref.key);
         }
     }
 }
