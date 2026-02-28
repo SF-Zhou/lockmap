@@ -761,7 +761,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
 
 impl<K: Eq + Hash + Clone, V> Default for LruLockMap<K, V> {
     fn default() -> Self {
-        Self::new(0)
+        Self::new(usize::MAX)
     }
 }
 
