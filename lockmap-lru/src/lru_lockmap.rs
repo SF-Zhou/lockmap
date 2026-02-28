@@ -196,9 +196,9 @@ impl<K: Eq + Hash, V> LruShardInner<K, V> {
     /// are currently in use (refcnt > 0) are **skipped** and traversal continues
     /// to the next candidate. This ensures eviction still makes progress even
     /// when the tail entry is held by another thread.
-    fn try_evict(&mut self) {
+    fn try_evict(&mut self, current: *mut State<K, V>) {
         let mut cursor = self.tail;
-        while self.map.len() > self.capacity && !cursor.is_null() {
+        while self.map.len() > self.capacity && !cursor.is_null() && cursor != current {
             // SAFETY: `cursor` is guaranteed non-null by the while condition.
             // We read `prev` before a potential detach so we can advance the
             // cursor even after `cursor` is detached and freed. `prev` may be
@@ -218,7 +218,7 @@ impl<K: Eq + Hash, V> LruShardInner<K, V> {
 
             // Remove from the HashMap. This drops the `AliasableBox` and frees
             // the `State` allocation.
-            self.map.remove(&state.key);
+            let _state = self.map.remove(&state.key);
 
             cursor = prev;
         }
@@ -382,7 +382,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                     // SAFETY: ptr is valid and ref-counted via AliasableBox.
                     unsafe { &*ptr }.inc_ref();
                     unsafe { inner.move_to_front(ptr) };
-                    inner.try_evict();
+                    inner.try_evict(ptr);
                     ptr
                 }
                 None => {
@@ -391,7 +391,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                     let ptr = &*state as *const State<K, V> as *mut State<K, V>;
                     inner.map.insert(key_clone, state);
                     unsafe { inner.push_front(ptr) };
-                    inner.try_evict();
+                    inner.try_evict(ptr);
                     ptr
                 }
             }
@@ -429,7 +429,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                 Some(ptr) => {
                     unsafe { &*ptr }.inc_ref();
                     unsafe { inner.move_to_front(ptr) };
-                    inner.try_evict();
+                    inner.try_evict(ptr);
                     ptr
                 }
                 None => {
@@ -439,7 +439,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                     let ptr = &*state as *const State<K, V> as *mut State<K, V>;
                     inner.map.insert(key_clone, state);
                     unsafe { inner.push_front(ptr) };
-                    inner.try_evict();
+                    inner.try_evict(ptr);
                     ptr
                 }
             }
@@ -543,10 +543,10 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                 None => {
                     let key_clone = key.clone();
                     let state = State::new(key, Some(value), 0);
-                    let p = &*state as *const State<K, V> as *mut State<K, V>;
+                    let ptr = &*state as *const State<K, V> as *mut State<K, V>;
                     inner.map.insert(key_clone, state);
-                    unsafe { inner.push_front(p) };
-                    inner.try_evict();
+                    unsafe { inner.push_front(ptr) };
+                    inner.try_evict(ptr);
                     (std::ptr::null_mut(), None)
                 }
             }
@@ -604,10 +604,10 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
                     let owned_key: K = key.into();
                     let key_clone = owned_key.clone();
                     let state = State::new(owned_key, Some(value), 0);
-                    let p = &*state as *const State<K, V> as *mut State<K, V>;
+                    let ptr = &*state as *const State<K, V> as *mut State<K, V>;
                     inner.map.insert(key_clone, state);
-                    unsafe { inner.push_front(p) };
-                    inner.try_evict();
+                    unsafe { inner.push_front(ptr) };
+                    inner.try_evict(ptr);
                     (std::ptr::null_mut(), None)
                 }
             }
@@ -947,6 +947,18 @@ mod tests {
         let cache = LruLockMap::<u32, u32>::default();
         println!("{:?}", cache);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_zero_capacity() {
+        let cache = LruLockMap::<u32, u32>::with_capacity_and_shard_amount(0, 1);
+        assert!(cache.is_empty());
+
+        assert_eq!(cache.insert(1, 10), None);
+        assert_eq!(cache.len(), 1);
+
+        assert_eq!(cache.insert(2, 20), None);
+        assert_eq!(cache.len(), 1); // still 1 due to eviction
     }
 
     // --- LRU eviction ---
