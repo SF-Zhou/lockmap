@@ -226,9 +226,7 @@ impl<K: Eq + Hash, V> LruShardInner<K, V> {
             // Remove from the HashTable using the stored hash and pointer
             // equality.  This avoids re-hashing the key.
             let hash = state.hash;
-            if let Ok(entry) = self.table.find_entry(hash, |s| {
-                std::ptr::eq(&**s, cursor)
-            }) {
+            if let Ok(entry) = self.table.find_entry(hash, |s| std::ptr::eq(&**s, cursor)) {
                 let _ = entry.remove();
             }
 
@@ -394,30 +392,25 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         let ptr: *mut State<K, V> = {
             let mut inner = shard.inner.lock().unwrap();
             // Single lookup: find existing entry or prepare insert slot.
-            let (ptr, is_new) = match inner.table.entry(
-                hash,
-                |s| s.key.borrow() == &key,
-                Self::state_hasher(),
-            ) {
-                Entry::Occupied(occupied) => {
-                    let ptr = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
-                    (ptr, false)
-                }
-                Entry::Vacant(vacant) => {
-                    let state = State::new(key, None, 1, hash);
-                    let ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                    vacant.insert(state);
-                    (ptr, true)
-                }
-            };
-            // Entry is consumed above; table borrow is released.
-            if is_new {
-                unsafe { inner.push_front(ptr) };
-            } else {
-                // SAFETY: ptr is valid and ref-counted via AliasableBox.
-                unsafe { &*ptr }.inc_ref();
-                unsafe { inner.move_to_front(ptr) };
-            }
+            let ptr =
+                match inner
+                    .table
+                    .entry(hash, |s| s.key.borrow() == &key, Self::state_hasher())
+                {
+                    Entry::Occupied(occupied) => {
+                        let ptr = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
+                        unsafe { &*ptr }.inc_ref();
+                        unsafe { inner.move_to_front(ptr) };
+                        ptr
+                    }
+                    Entry::Vacant(vacant) => {
+                        let state = State::new(key, None, 1, hash);
+                        let ptr = &*state as *const State<K, V> as *mut State<K, V>;
+                        vacant.insert(state);
+                        unsafe { inner.push_front(ptr) };
+                        ptr
+                    }
+                };
             inner.try_evict(ptr);
             ptr
         };
@@ -447,29 +440,25 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         let shard = &self.shards[self.shard_index(hash)];
         let ptr: *mut State<K, V> = {
             let mut inner = shard.inner.lock().unwrap();
-            let (ptr, is_new) = match inner.table.entry(
-                hash,
-                |s| s.key.borrow() == key,
-                Self::state_hasher(),
-            ) {
+            let ptr = match inner
+                .table
+                .entry(hash, |s| s.key.borrow() == key, Self::state_hasher())
+            {
                 Entry::Occupied(occupied) => {
                     let ptr = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
-                    (ptr, false)
+                    unsafe { &*ptr }.inc_ref();
+                    unsafe { inner.move_to_front(ptr) };
+                    ptr
                 }
                 Entry::Vacant(vacant) => {
                     let owned_key: K = key.into();
                     let state = State::new(owned_key, None, 1, hash);
                     let ptr = &*state as *const State<K, V> as *mut State<K, V>;
                     vacant.insert(state);
-                    (ptr, true)
+                    unsafe { inner.push_front(ptr) };
+                    ptr
                 }
             };
-            if is_new {
-                unsafe { inner.push_front(ptr) };
-            } else {
-                unsafe { &*ptr }.inc_ref();
-                unsafe { inner.move_to_front(ptr) };
-            }
             inner.try_evict(ptr);
             ptr
         };
@@ -549,26 +538,12 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         let shard = &self.shards[self.shard_index(hash)];
         let (ptr, old) = {
             let mut inner = shard.inner.lock().unwrap();
-            // Phase 1: single-lookup find-or-insert.
-            let (p, remaining_value) = match inner.table.entry(
-                hash,
-                |s| s.key.borrow() == &key,
-                Self::state_hasher(),
-            ) {
+            match inner
+                .table
+                .entry(hash, |s| s.key.borrow() == &key, Self::state_hasher())
+            {
                 Entry::Occupied(occupied) => {
                     let p = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
-                    (p, Some(value))
-                }
-                Entry::Vacant(vacant) => {
-                    let state = State::new(key, Some(value), 0, hash);
-                    let new_ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                    vacant.insert(state);
-                    (new_ptr, None)
-                }
-            };
-            // Phase 2: linked-list operations (table entry dropped above).
-            match remaining_value {
-                Some(value) => {
                     unsafe { inner.move_to_front(p) };
                     let state = unsafe { &*p };
                     let flags = state.flags();
@@ -582,9 +557,12 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
                         (p, Some(value))
                     }
                 }
-                None => {
-                    unsafe { inner.push_front(p) };
-                    inner.try_evict(p);
+                Entry::Vacant(vacant) => {
+                    let state = State::new(key, Some(value), 0, hash);
+                    let new_ptr = &*state as *const State<K, V> as *mut State<K, V>;
+                    vacant.insert(state);
+                    unsafe { inner.push_front(new_ptr) };
+                    inner.try_evict(new_ptr);
                     (std::ptr::null_mut(), None)
                 }
             }
@@ -618,25 +596,12 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         let shard = &self.shards[self.shard_index(hash)];
         let (ptr, old) = {
             let mut inner = shard.inner.lock().unwrap();
-            let (p, remaining_value) = match inner.table.entry(
-                hash,
-                |s| s.key.borrow() == key,
-                Self::state_hasher(),
-            ) {
+            match inner
+                .table
+                .entry(hash, |s| s.key.borrow() == key, Self::state_hasher())
+            {
                 Entry::Occupied(occupied) => {
                     let p = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
-                    (p, Some(value))
-                }
-                Entry::Vacant(vacant) => {
-                    let owned_key: K = key.into();
-                    let state = State::new(owned_key, Some(value), 0, hash);
-                    let new_ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                    vacant.insert(state);
-                    (new_ptr, None)
-                }
-            };
-            match remaining_value {
-                Some(value) => {
                     unsafe { inner.move_to_front(p) };
                     let state = unsafe { &*p };
                     let flags = state.flags();
@@ -649,9 +614,13 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
                         (p, Some(value))
                     }
                 }
-                None => {
-                    unsafe { inner.push_front(p) };
-                    inner.try_evict(p);
+                Entry::Vacant(vacant) => {
+                    let owned_key: K = key.into();
+                    let state = State::new(owned_key, Some(value), 0, hash);
+                    let new_ptr = &*state as *const State<K, V> as *mut State<K, V>;
+                    vacant.insert(state);
+                    unsafe { inner.push_front(new_ptr) };
+                    inner.try_evict(new_ptr);
                     (std::ptr::null_mut(), None)
                 }
             }
@@ -913,9 +882,10 @@ impl<K: Eq + Hash, V> Drop for LruEntry<'_, K, V> {
             // Detach from linked list first, then remove from table.
             unsafe { inner.detach(self.state) };
             let state_ptr = self.state as *const State<K, V>;
-            if let Ok(entry) = inner.table.find_entry(state_ref.hash, |s| {
-                std::ptr::eq(&**s, state_ptr)
-            }) {
+            if let Ok(entry) = inner
+                .table
+                .find_entry(state_ref.hash, |s| std::ptr::eq(&**s, state_ptr))
+            {
                 let _ = entry.remove();
             }
         }
