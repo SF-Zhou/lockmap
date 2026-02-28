@@ -749,6 +749,9 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
                     if state.flags().refcnt() == 0 {
                         // SAFETY: refcnt == 0 → exclusive.
                         let value = unsafe { state.value_mut() }.take();
+                        // Remove from table first (consuming the OccupiedEntry
+                        // to release the borrow), then detach from linked list
+                        // while the returned box keeps the State memory alive.
                         let (state_box, _) = occupied.remove();
                         unsafe { inner.detach(p) };
                         drop(state_box);
@@ -907,14 +910,13 @@ impl<K: Eq + Hash, V> Drop for LruEntry<'_, K, V> {
         let final_flags = state_ref.dec_ref();
         if final_flags.pending_cleanup() {
             // SAFETY: The entry is in the linked list and the shard lock is held.
-            // Remove from table using stored hash + pointer equality (no re-hash).
+            // Detach from linked list first, then remove from table.
+            unsafe { inner.detach(self.state) };
             let state_ptr = self.state as *const State<K, V>;
             if let Ok(entry) = inner.table.find_entry(state_ref.hash, |s| {
                 std::ptr::eq(&**s, state_ptr)
             }) {
-                let (state_box, _) = entry.remove();
-                unsafe { inner.detach(self.state) };
-                drop(state_box);
+                let _ = entry.remove();
             }
         }
     }
