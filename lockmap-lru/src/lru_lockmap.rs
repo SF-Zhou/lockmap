@@ -368,7 +368,7 @@ fn default_shard_amount() -> usize {
     })
 }
 
-impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
+impl<K: Eq + Hash, V> LruLockMap<K, V> {
     /// Creates a new `LruLockMap` with the given total capacity.
     ///
     /// The capacity is divided evenly among the default number of shards.
@@ -759,7 +759,7 @@ impl<K: Eq + Hash + Clone, V> LruLockMap<K, V> {
     }
 }
 
-impl<K: Eq + Hash + Clone, V> Default for LruLockMap<K, V> {
+impl<K: Eq + Hash, V> Default for LruLockMap<K, V> {
     fn default() -> Self {
         Self::new(usize::MAX)
     }
@@ -782,16 +782,16 @@ impl<K, V> std::fmt::Debug for LruLockMap<K, V> {
 ///
 /// When dropped, this type automatically unlocks the entry and may trigger
 /// cleanup of empty entries.
-pub struct LruEntry<'a, K: Eq + Hash + Clone, V> {
+pub struct LruEntry<'a, K: Eq + Hash, V> {
     map: &'a LruLockMap<K, V>,
     state: *mut State<K, V>,
 }
 
 // SAFETY: The guard holds a per-key mutex lock and a valid, ref-counted pointer.
-unsafe impl<K: Eq + Hash + Clone + Send, V: Send> Send for LruEntry<'_, K, V> {}
-unsafe impl<K: Eq + Hash + Clone + Send + Sync, V: Send + Sync> Sync for LruEntry<'_, K, V> {}
+unsafe impl<K: Eq + Hash + Send, V: Send> Send for LruEntry<'_, K, V> {}
+unsafe impl<K: Eq + Hash + Send + Sync, V: Send + Sync> Sync for LruEntry<'_, K, V> {}
 
-impl<K: Eq + Hash + Clone, V> LruEntry<'_, K, V> {
+impl<K: Eq + Hash, V> LruEntry<'_, K, V> {
     /// Returns a reference to the entry's key.
     pub fn key(&self) -> &K {
         // SAFETY: The state pointer is valid for the lifetime of this guard
@@ -826,9 +826,7 @@ impl<K: Eq + Hash + Clone, V> LruEntry<'_, K, V> {
     }
 }
 
-impl<K: Eq + Hash + Clone + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug
-    for LruEntry<'_, K, V>
-{
+impl<K: Eq + Hash + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for LruEntry<'_, K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LruEntry")
             .field("key", self.key())
@@ -837,7 +835,7 @@ impl<K: Eq + Hash + Clone + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug
     }
 }
 
-impl<K: Eq + Hash + Clone, V> Drop for LruEntry<'_, K, V> {
+impl<K: Eq + Hash, V> Drop for LruEntry<'_, K, V> {
     /// Drop implementation for `LruEntry`.
     ///
     /// 1. Update the value state flag to ensure `flags` reflects whether the value exists.
