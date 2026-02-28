@@ -126,7 +126,7 @@ struct LruShardInner<K, V> {
 // the shard's `std::sync::Mutex` is held, ensuring exclusive access.
 unsafe impl<K: Send, V: Send> Send for LruShardInner<K, V> {}
 
-impl<K: Eq + Hash, V> LruShardInner<K, V> {
+impl<K, V> LruShardInner<K, V> {
     fn with_capacity(max_size: usize, capacity: usize) -> Self {
         Self {
             table: HashTable::with_capacity(capacity),
@@ -203,6 +203,9 @@ impl<K: Eq + Hash, V> LruShardInner<K, V> {
     /// are currently in use (refcnt > 0) are **skipped** and traversal continues
     /// to the next candidate. This ensures eviction still makes progress even
     /// when the tail entry is held by another thread.
+    ///
+    /// `current` is the entry that was just accessed or inserted — it must not
+    /// be evicted even though it is at the head of the list.
     fn try_evict(&mut self, current: *mut State<K, V>) {
         let mut cursor = self.tail;
         while self.table.len() > self.max_size && !cursor.is_null() && cursor != current {
@@ -243,7 +246,7 @@ struct LruShardMap<K, V> {
     inner: std::sync::Mutex<LruShardInner<K, V>>,
 }
 
-impl<K: Eq + Hash, V> LruShardMap<K, V> {
+impl<K, V> LruShardMap<K, V> {
     fn with_capacity(max_size: usize, capacity: usize) -> Self {
         Self {
             inner: std::sync::Mutex::new(LruShardInner::with_capacity(max_size, capacity)),
@@ -321,15 +324,14 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
 
     /// Creates a new `LruLockMap` with the given total capacity and number of shards.
     ///
-    /// Each shard will have a capacity of `capacity / shard_amount` (rounded up
-    /// for the first shard to absorb the remainder).
+    /// Each shard will have a capacity of `max_size / shard_amount` (rounded up).
     pub fn with_options(max_size: usize, initial_capacity: usize, shard_amount: usize) -> Self {
         assert!(shard_amount > 0, "shard_amount must be greater than 0");
-        let per_thread_max_size = max_size.div_ceil(shard_amount);
-        let per_thread_capacity = initial_capacity.div_ceil(shard_amount);
+        let per_shard_max_size = max_size.div_ceil(shard_amount);
+        let per_shard_capacity = initial_capacity.div_ceil(shard_amount);
         Self {
             shards: (0..shard_amount)
-                .map(|_| LruShardMap::with_capacity(per_thread_max_size, per_thread_capacity))
+                .map(|_| LruShardMap::with_capacity(per_shard_max_size, per_shard_capacity))
                 .collect(),
             hasher: RandomState::default(),
         }
