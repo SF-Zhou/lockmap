@@ -260,6 +260,14 @@ impl<K, V> LruShardMap<K, V> {
     fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().table.is_empty()
     }
+
+    fn max_size(&self) -> usize {
+        self.inner.lock().unwrap().max_size
+    }
+
+    fn set_max_size(&self, max_size: usize) {
+        self.inner.lock().unwrap().max_size = max_size;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +353,20 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
     /// Returns `true` if the cache contains no entries.
     pub fn is_empty(&self) -> bool {
         self.shards.iter().all(|s| s.is_empty())
+    }
+
+    /// Returns the maximum number of entries across all shards.
+    pub fn max_size(&self) -> usize {
+        let max_size = self.shards.first().map(|s| s.max_size()).unwrap_or(0);
+        self.shards.len() * max_size
+    }
+
+    /// Sets the maximum number of entries across all shards.
+    pub fn set_max_size(&mut self, max_size: usize) {
+        let per_shard_max_size = max_size.div_ceil(self.shards.len());
+        for shard in &mut self.shards {
+            shard.set_max_size(per_shard_max_size);
+        }
     }
 
     // --- shard routing ---
@@ -999,6 +1021,14 @@ mod tests {
 
         assert_eq!(cache.insert(2, 20), None);
         assert_eq!(cache.len(), 1); // still 1 due to eviction
+    }
+
+    #[test]
+    fn test_set_max_size() {
+        let mut cache = LruLockMap::<u32, u32>::with_options(3, 3, 4);
+        assert_eq!(cache.max_size(), 4);
+        cache.set_max_size(6);
+        assert_eq!(cache.max_size(), 8);
     }
 
     // --- LRU eviction ---
