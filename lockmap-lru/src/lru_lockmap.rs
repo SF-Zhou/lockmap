@@ -260,6 +260,14 @@ impl<K, V> LruShardMap<K, V> {
     fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().table.is_empty()
     }
+
+    fn max_size(&self) -> usize {
+        self.inner.lock().unwrap().max_size
+    }
+
+    fn set_max_size(&self, max_size: usize) {
+        self.inner.lock().unwrap().max_size = max_size;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +353,60 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
     /// Returns `true` if the cache contains no entries.
     pub fn is_empty(&self) -> bool {
         self.shards.iter().all(|s| s.is_empty())
+    }
+
+    /// Returns the configured target capacity of the cache, in number of entries.
+    ///
+    /// This is the total logical capacity across all shards, computed from the
+    /// per‑shard limits. The per‑shard limit is derived using
+    /// `max_size.div_ceil(shard_amount)`, so the effective total capacity may be
+    /// rounded up compared to the value originally passed to [`with_options`].
+    ///
+    /// Note that this is not a strict upper bound on [`len`](Self::len). In
+    /// particular, eviction may skip entries that are currently in use (e.g.
+    /// with a positive reference count), and implementation details such as a
+    /// minimum of one entry per shard can also cause the actual number of
+    /// stored entries to temporarily exceed this configured target.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap_lru::LruLockMap;
+    /// let cache = LruLockMap::<String, u32>::with_options(100, 100, 10);
+    /// assert_eq!(cache.max_size(), 100);
+    /// ```
+    pub fn max_size(&self) -> usize {
+        let max_size = self.shards.first().map(|s| s.max_size()).unwrap_or(0);
+        self.shards.len() * max_size
+    }
+
+    /// Sets the maximum number of entries that can be stored in the cache.
+    ///
+    /// The capacity is divided evenly among all shards. Note that the actual
+    /// capacity may be slightly larger than requested due to rounding up when
+    /// dividing by number of shards.
+    ///
+    /// **Eviction behavior:** This operation does not immediately trigger eviction
+    /// of excess entries. Eviction will occur lazily on subsequent insertions
+    /// and other operations that may increase the cache size.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_size` - The new maximum number of entries across all shards
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap_lru::LruLockMap;
+    /// let mut cache = LruLockMap::<u32, u32>::with_options(100, 100, 10);
+    /// cache.set_max_size(200);
+    /// assert_eq!(cache.max_size(), 200);
+    /// ```
+    pub fn set_max_size(&self, max_size: usize) {
+        let per_shard_max_size = max_size.div_ceil(self.shards.len());
+        for shard in &self.shards {
+            shard.set_max_size(per_shard_max_size);
+        }
     }
 
     // --- shard routing ---
@@ -999,6 +1061,14 @@ mod tests {
 
         assert_eq!(cache.insert(2, 20), None);
         assert_eq!(cache.len(), 1); // still 1 due to eviction
+    }
+
+    #[test]
+    fn test_set_max_size() {
+        let mut cache = LruLockMap::<u32, u32>::with_options(3, 3, 4);
+        assert_eq!(cache.max_size(), 4);
+        cache.set_max_size(6);
+        assert_eq!(cache.max_size(), 8);
     }
 
     // --- LRU eviction ---
