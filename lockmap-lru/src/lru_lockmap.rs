@@ -355,10 +355,18 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         self.shards.iter().all(|s| s.is_empty())
     }
 
-    /// Returns the maximum number of entries that can be stored in the cache.
+    /// Returns the configured target capacity of the cache, in number of entries.
     ///
-    /// This returns the total capacity across all shards. When the cache size
-    /// exceeds this value, least recently used entries will be evicted.
+    /// This is the total logical capacity across all shards, computed from the
+    /// per‑shard limits. The per‑shard limit is derived using
+    /// `max_size.div_ceil(shard_amount)`, so the effective total capacity may be
+    /// rounded up compared to the value originally passed to [`with_options`].
+    ///
+    /// Note that this is not a strict upper bound on [`len`](Self::len). In
+    /// particular, eviction may skip entries that are currently in use (e.g.
+    /// with a positive reference count), and implementation details such as a
+    /// minimum of one entry per shard can also cause the actual number of
+    /// stored entries to temporarily exceed this configured target.
     ///
     /// # Examples
     ///
@@ -394,9 +402,9 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
     /// cache.set_max_size(200);
     /// assert_eq!(cache.max_size(), 200);
     /// ```
-    pub fn set_max_size(&mut self, max_size: usize) {
+    pub fn set_max_size(&self, max_size: usize) {
         let per_shard_max_size = max_size.div_ceil(self.shards.len());
-        for shard in &mut self.shards {
+        for shard in &self.shards {
             shard.set_max_size(per_shard_max_size);
         }
     }
