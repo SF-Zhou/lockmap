@@ -6,17 +6,16 @@
 [![Documentation](https://docs.rs/lockmap/badge.svg)](https://docs.rs/lockmap)
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FSF-Zhou%2Flockmap.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FSF-Zhou%2Flockmap?ref=badge_shield)
 
-A family of high-performance, thread-safe concurrent map crates for Rust with **fine-grained per-key locking**.
+A high-performance, thread-safe HashMap and LRU cache for Rust with **fine-grained per-key locking**.
 
-## Workspace Crates
+## Data Structures
 
-| Crate | Description |
-|-------|-------------|
-| [`lockmap-core`](lockmap-core/) | Shared infrastructure: fast futex-based mutex and sharded map primitives |
-| [`lockmap`](lockmap/) | Thread-safe HashMap with per-key level locking |
-| [`lockmap-lru`](lockmap-lru/) | Thread-safe LRU cache with per-key locking and automatic capacity-based eviction |
+| Type | Description |
+|------|-------------|
+| [`LockMap`](https://docs.rs/lockmap/latest/lockmap/struct.LockMap.html) | Thread-safe HashMap with per-key level locking |
+| [`LruLockMap`](https://docs.rs/lockmap/latest/lockmap/struct.LruLockMap.html) | Thread-safe LRU cache with per-key locking and automatic capacity-based eviction |
 
-## lockmap
+## LockMap
 
 **LockMap** is a high-performance, thread-safe HashMap implementation that provides **fine-grained locking at the key level**.
 
@@ -27,8 +26,9 @@ Unlike standard concurrent maps that might lock the entire map or large buckets,
 *   **Key-Level Locking**: Acquire exclusive locks for specific keys. Operations on different keys run in parallel.
 *   **Sharding Architecture**: Internal sharding reduces contention on the map structure itself during insertions and removals.
 *   **Deadlock Prevention**: Provides `batch_lock` to safely acquire locks on multiple keys simultaneously using a deterministic order.
-*   **Efficient Waiting**: Uses a hybrid spin-then-park Futex implementation for low-overhead locking.
-*   **Entry API**: Ergonomic RAII guards (`EntryByVal`, `EntryByRef`) for managing locks.
+*   **Single Hash Computation**: Each key is hashed once; the pre-computed hash is stored alongside the key and reused for shard selection, table probing, and rehashing.
+*   **No Key Duplication**: Uses `hashbrown::HashTable` so each key is stored only once, inside the entry state.
+*   **Entry API**: Ergonomic unified RAII guard (`Entry`) for managing locks.
 
 ### Usage
 
@@ -69,19 +69,19 @@ keys.insert("key2".to_string());
 // `locked_entries` holds all the locks
 let mut locked_entries = map.batch_lock::<std::collections::HashMap<_, _>>(keys);
 
-if let Some(mut entry) = locked_entries.get_mut("key1") {
+if let Some(entry) = locked_entries.get_mut("key1") {
    entry.insert("updated_in_batch".into());
 }
 // All locks released when `locked_entries` is dropped
 ```
 
-## lockmap-lru
+## LruLockMap
 
 **LruLockMap** extends the per-key locking design with **LRU (Least Recently Used) eviction**. Each internal shard maintains its own LRU ordering via an intrusive doubly-linked list, ensuring that eviction decisions are local and lock-free from other shards.
 
 ### Features
 
-*   **Per-Key Locking**: Same fine-grained locking as `lockmap`.
+*   **Per-Key Locking**: Same fine-grained locking as `LockMap`.
 *   **Per-Shard LRU Eviction**: Each shard independently tracks access order and evicts least recently used entries when capacity is exceeded.
 *   **Non-Blocking Eviction**: In-use entries are skipped during eviction; traversal continues to the next candidate, ensuring progress even when the tail is held.
 *   **Intrusive Linked List**: LRU bookkeeping uses pointers embedded directly in each entry, avoiding extra allocations.
@@ -91,7 +91,7 @@ if let Some(mut entry) = locked_entries.get_mut("key1") {
 ### Usage
 
 ```rust
-use lockmap_lru::LruLockMap;
+use lockmap::LruLockMap;
 
 // Create a cache with capacity 1000
 let cache = LruLockMap::<String, String>::new(1000);
@@ -124,6 +124,31 @@ Unlike `std::sync::Mutex`, **this library does not implement lock poisoning**. I
 
 The `map.get(key)` method clones the value while holding an internal shard lock.
 > **Note**: If your value type `V` is expensive to clone (e.g., deep copy of large structures), or if `clone()` acquires other locks, use `map.entry(key).get()` instead. This moves the clone operation outside the internal map lock, preventing blocking of other threads accessing the same shard.
+
+## Changelog
+
+### 0.2.0
+
+This is a major restructuring release. The previous workspace of three crates (`lockmap`, `lockmap-lru`, `lockmap-core`) has been consolidated into a single `lockmap` crate.
+
+#### Breaking Changes
+
+*   **Unified crate**: `lockmap-lru` and `lockmap-core` no longer exist as separate crates. Import both `LockMap` and `LruLockMap` from `lockmap`:
+    ```rust
+    use lockmap::{LockMap, LruLockMap};
+    ```
+*   **Unified `Entry` type**: The separate `EntryByVal` and `EntryByRef` types in `LockMap` have been replaced by a single [`Entry`](https://docs.rs/lockmap/latest/lockmap/struct.Entry.html) type. The key is now stored inside the entry state and accessed via `entry.key()`.
+*   **`parking_lot` mutex**: The custom futex-based mutex and `atomic-wait` dependency have been replaced by `parking_lot::RawMutex`.
+*   **`HashTable` storage for `LockMap`**: `LockMap` now uses `hashbrown::HashTable` (like `LruLockMap`) with the key and pre-computed hash stored in the entry state. Each operation hashes the key only once.
+
+#### Migration Guide
+
+| 0.1.x | 0.2.0 |
+|-------|-------|
+| `use lockmap::EntryByVal` | `use lockmap::Entry` |
+| `use lockmap::EntryByRef` | `use lockmap::Entry` |
+| `use lockmap_lru::LruLockMap` | `use lockmap::LruLockMap` |
+| `use lockmap_lru::LruEntry` | `use lockmap::LruEntry` |
 
 ## License
 
