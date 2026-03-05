@@ -32,15 +32,16 @@ jobs:
         cargo llvm-cov report --cobertura --output-path target/llvm-cov-target/cobertura.xml
 
     - name: Upload coverage reports to Codecov
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         slug: SF-Zhou/lockmap
         files: target/llvm-cov-target/cobertura.xml
 
     - name: Upload test results to Codecov
-      uses: codecov/test-results-action@v1
+      uses: codecov/codecov-action@v5
       with:
+        report_type: test_results
         token: ${{ secrets.CODECOV_TOKEN }}
         slug: SF-Zhou/lockmap
         files: target/nextest/default/junit.xml
