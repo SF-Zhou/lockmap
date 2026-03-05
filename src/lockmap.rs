@@ -1182,4 +1182,21 @@ mod tests {
             THREADS as u32 * OPS_PER_THREAD as u32
         );
     }
+
+    #[test]
+    fn test_lockmap_grow() {
+        let lock_map = Arc::new(LockMap::<u32, u32>::with_capacity(4));
+        #[cfg(not(miri))]
+        const N: usize = 1 << 12;
+        #[cfg(miri)]
+        const N: usize = 1 << 6;
+
+        for i in 0..N {
+            lock_map.insert(i as u32, i as u32);
+        }
+
+        for i in 0..N {
+            assert_eq!(lock_map.get(&(i as u32)), Some(i as u32));
+        }
+    }
 }
