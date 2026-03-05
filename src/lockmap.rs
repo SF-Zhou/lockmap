@@ -1,16 +1,20 @@
 use aliasable::boxed::AliasableBox;
-use lockmap_core::{Mutex, ShardsMap, SimpleAction, UpdateAction};
+use foldhash::fast::RandomState;
+use hashbrown::hash_table::Entry as TableEntry;
+use hashbrown::HashTable;
+use parking_lot::lock_api::RawMutex as _;
+use parking_lot::RawMutex;
 use std::borrow::Borrow;
 use std::cell::UnsafeCell;
 use std::collections::BTreeSet;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
-/// Internal flags for `State<V>`.
-///
-/// This struct wraps an `u32` to store both the reference count and a "has value" flag.
-/// The highest bit is used for the flag, and the remaining bits for the reference count.
+// ---------------------------------------------------------------------------
+// StateFlags
+// ---------------------------------------------------------------------------
+
 struct StateFlags(u32);
 
 impl StateFlags {
@@ -34,25 +38,29 @@ impl StateFlags {
     }
 
     fn pending_cleanup(&self) -> bool {
-        self.0 == 0 // equal to `self.refcnt() == 0 && !self.has_value()`
+        self.0 == 0
     }
 }
 
-/// Internal state for a key-value pair in the `LockMap`.
-///
-/// This type manages the stored value, the per-key lock, and a reference count
-/// used for both synchronization optimization and memory management.
-struct State<V> {
+// ---------------------------------------------------------------------------
+// State – per-key state with key and pre-computed hash
+// ---------------------------------------------------------------------------
+
+struct State<K, V> {
+    key: K,
+    hash: u64,
     flags: AtomicU32,
-    mutex: Mutex,
+    mutex: RawMutex,
     value: UnsafeCell<Option<V>>,
 }
 
-impl<V> State<V> {
-    fn new(value: Option<V>, refcnt: u32) -> AliasableBox<Self> {
+impl<K, V> State<K, V> {
+    fn new(key: K, value: Option<V>, refcnt: u32, hash: u64) -> AliasableBox<Self> {
         AliasableBox::from_unique(Box::new(Self {
+            key,
+            hash,
             flags: AtomicU32::new(StateFlags::new(refcnt, value.is_some()).0),
-            mutex: Mutex::new(),
+            mutex: RawMutex::INIT,
             value: UnsafeCell::new(value),
         }))
     }
@@ -101,9 +109,94 @@ impl<V> State<V> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ShardInner – HashTable storage
+// ---------------------------------------------------------------------------
+
+struct ShardInner<K, V> {
+    table: HashTable<AliasableBox<State<K, V>>>,
+}
+
+impl<K, V> ShardInner<K, V> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            table: HashTable::with_capacity(capacity),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ShardMap
+// ---------------------------------------------------------------------------
+
+struct ShardMap<K, V> {
+    inner: std::sync::Mutex<ShardInner<K, V>>,
+}
+
+impl<K, V> ShardMap<K, V> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(ShardInner::with_capacity(capacity)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().table.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().table.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LockMap
+// ---------------------------------------------------------------------------
+
 /// A thread-safe hashmap that supports locking entries at the key level.
+///
+/// `LockMap` provides a concurrent hashmap with fine-grained per-key locking.
+/// Each key can be independently locked, so operations on different keys can
+/// proceed in parallel. The map is internally sharded to reduce contention on
+/// the map structure itself.
+///
+/// # Storage Design
+///
+/// The key and its pre-computed hash are stored together in the internal entry
+/// state, so each operation hashes the key only once. The full hash is also
+/// reused for shard selection and table probing.
+///
+/// # Examples
+///
+/// ```
+/// use lockmap::LockMap;
+///
+/// let map = LockMap::<String, u32>::new();
+///
+/// // Basic operations
+/// map.insert("key1".to_string(), 42);
+/// assert_eq!(map.get("key1"), Some(42));
+///
+/// // Entry API for exclusive access
+/// {
+///     let mut entry = map.entry("key2".to_string());
+///     entry.insert(123);
+/// }
+///
+/// // Remove a value
+/// assert_eq!(map.remove("key1"), Some(42));
+/// assert_eq!(map.get("key1"), None);
+/// ```
 pub struct LockMap<K, V> {
-    map: ShardsMap<K, AliasableBox<State<V>>>,
+    shards: Vec<ShardMap<K, V>>,
+    hasher: RandomState,
+}
+
+fn default_shard_amount() -> usize {
+    static DEFAULT_SHARD_AMOUNT: OnceLock<usize> = OnceLock::new();
+    *DEFAULT_SHARD_AMOUNT.get_or_init(|| {
+        (std::thread::available_parallelism().map_or(1, usize::from) * 4).next_power_of_two()
+    })
 }
 
 impl<K: Eq + Hash, V> Default for LockMap<K, V> {
@@ -112,160 +205,152 @@ impl<K: Eq + Hash, V> Default for LockMap<K, V> {
     }
 }
 
-/// Returns the default number of shards to use for the `LockMap`.
-fn default_shard_amount() -> usize {
-    static DEFAULT_SHARD_AMOUNT: OnceLock<usize> = OnceLock::new();
-    *DEFAULT_SHARD_AMOUNT.get_or_init(|| {
-        (std::thread::available_parallelism().map_or(1, usize::from) * 4).next_power_of_two()
-    })
-}
-
-/// The main thread-safe map type providing per-key level locking.
 impl<K: Eq + Hash, V> LockMap<K, V> {
     /// Creates a new `LockMap` with the default number of shards.
-    ///
-    /// # Returns
-    ///
-    /// A new `LockMap` instance.
     pub fn new() -> Self {
-        Self {
-            map: ShardsMap::with_capacity_and_shard_amount(0, default_shard_amount()),
-        }
+        Self::with_capacity_and_shard_amount(0, default_shard_amount())
     }
 
-    /// Creates a new `LockMap` with the specified initial capacity and the default number of shards.
-    ///
-    /// # Arguments
-    ///
-    /// * `capacity` - The initial capacity of the hashmap.
-    ///
-    /// # Returns
-    ///
-    /// A new `LockMap` instance.
+    /// Creates a new `LockMap` with the specified initial capacity.
     pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            map: ShardsMap::with_capacity_and_shard_amount(capacity, default_shard_amount()),
-        }
+        Self::with_capacity_and_shard_amount(capacity, default_shard_amount())
     }
 
     /// Creates a new `LockMap` with the specified initial capacity and number of shards.
-    ///
-    /// # Arguments
-    ///
-    /// * `capacity` - The initial capacity of the hashmap.
-    /// * `shard_amount` - The number of shards to create.
-    ///
-    /// # Returns
-    ///
-    /// A new `LockMap` instance.
     pub fn with_capacity_and_shard_amount(capacity: usize, shard_amount: usize) -> Self {
+        assert!(shard_amount > 0, "shard_amount must be greater than 0");
+        let per_shard_capacity = capacity.div_ceil(shard_amount);
         Self {
-            map: ShardsMap::with_capacity_and_shard_amount(capacity, shard_amount),
+            shards: (0..shard_amount)
+                .map(|_| ShardMap::with_capacity(per_shard_capacity))
+                .collect(),
+            hasher: RandomState::default(),
         }
     }
 
     /// Returns the number of elements in the map.
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.shards.iter().map(|s| s.len()).sum()
     }
 
     /// Returns `true` if the map contains no elements.
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.shards.iter().all(|s| s.is_empty())
     }
+
+    // --- shard routing ---
+
+    /// Compute the shard index from the full hash value.
+    ///
+    /// Uses the upper 32 bits of the hash for shard selection. The internal
+    /// `HashTable` uses the lower bits for bucket selection, so using the upper
+    /// bits avoids correlation between shard assignment and bucket placement.
+    #[inline(always)]
+    fn shard_index(&self, hash: u64) -> usize {
+        ((hash >> 32) as usize) % self.shards.len()
+    }
+
+    /// Rehash closure for `HashTable` growth — reuses the stored hash from
+    /// each `State`. This avoids calling the hasher entirely during rehash.
+    #[inline(always)]
+    fn state_hasher() -> impl Fn(&AliasableBox<State<K, V>>) -> u64 {
+        |s| s.hash
+    }
+
+    // ------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------
 
     /// Gets exclusive access to an entry in the map.
     ///
-    /// The returned `EntryByVal` provides exclusive access to the key and its associated value
-    /// until it is dropped.
+    /// The returned [`Entry`] provides exclusive access to the key and its
+    /// associated value until it is dropped.
     ///
     /// **Locking behaviour:** Deadlock if called when holding the same entry.
     ///
     /// # Examples
+    ///
     /// ```
     /// # use lockmap::LockMap;
     /// let map = LockMap::<String, u32>::new();
     /// {
     ///     let mut entry = map.entry("key".to_string());
     ///     entry.insert(42);
-    ///     // let _ = map.get("key".to_string()); // DEADLOCK!
-    ///     // map.insert("key".to_string(), 21); // DEADLOCK!
-    ///     // map.remove("key".to_string()); // DEADLOCK!
-    ///     // let mut entry2 = map.entry("key".to_string()); // DEADLOCK!
     /// }
     /// ```
-    pub fn entry(&self, key: K) -> EntryByVal<'_, K, V>
-    where
-        K: Clone,
-    {
-        let ptr: *mut State<V> = self.map.update(key.clone(), |s| match s {
-            Some(state) => {
-                state.inc_ref();
-                let ptr = &**state as *const State<V> as *mut State<V>;
-                (UpdateAction::Keep, ptr)
+    pub fn entry(&self, key: K) -> Entry<'_, K, V> {
+        let hash = self.hasher.hash_one(&key);
+        let shard = &self.shards[self.shard_index(hash)];
+        let ptr: *mut State<K, V> = {
+            let mut inner = shard.inner.lock().unwrap();
+            match inner
+                .table
+                .entry(hash, |s| s.key.borrow() == &key, Self::state_hasher())
+            {
+                TableEntry::Occupied(occupied) => {
+                    let ptr = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
+                    unsafe { &*ptr }.inc_ref();
+                    ptr
+                }
+                TableEntry::Vacant(vacant) => {
+                    let state = State::new(key, None, 1, hash);
+                    let ptr = &*state as *const State<K, V> as *mut State<K, V>;
+                    vacant.insert(state);
+                    ptr
+                }
             }
-            None => {
-                let state = State::new(None, 1);
-                let ptr = &*state as *const State<V> as *mut State<V>;
-                (UpdateAction::Replace(state), ptr)
-            }
-        });
-
-        self.guard_by_val(ptr, key)
+        };
+        self.guard(ptr)
     }
 
-    /// Gets exclusive access to an entry in the map.
-    ///
-    /// The returned `EntryByVal` provides exclusive access to the key and its associated value
-    /// until it is dropped.
+    /// Gets exclusive access to an entry by reference.
     ///
     /// **Locking behaviour:** Deadlock if called when holding the same entry.
     ///
     /// # Examples
+    ///
     /// ```
     /// # use lockmap::LockMap;
     /// let map = LockMap::<String, u32>::new();
     /// {
     ///     let mut entry = map.entry_by_ref("key");
     ///     entry.insert(42);
-    ///     // let _ = map.get("key"); // DEADLOCK!
-    ///     // map.insert_by_ref("key", 21); // DEADLOCK!
-    ///     // map.remove("key"); // DEADLOCK!
-    ///     // let mut entry2 = map.entry_by_ref("key"); // DEADLOCK!
     /// }
     /// ```
-    pub fn entry_by_ref<'a, 'b, Q>(&'a self, key: &'b Q) -> EntryByRef<'a, 'b, K, Q, V>
+    pub fn entry_by_ref<Q>(&self, key: &Q) -> Entry<'_, K, V>
     where
         K: Borrow<Q> + for<'c> From<&'c Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let ptr: *mut State<V> = self.map.update_by_ref(key, |s| match s {
-            Some(state) => {
-                state.inc_ref();
-                let ptr = &**state as *const State<V> as *mut State<V>;
-                (UpdateAction::Keep, ptr)
+        let hash = self.hasher.hash_one(key);
+        let shard = &self.shards[self.shard_index(hash)];
+        let ptr: *mut State<K, V> = {
+            let mut inner = shard.inner.lock().unwrap();
+            match inner
+                .table
+                .entry(hash, |s| s.key.borrow() == key, Self::state_hasher())
+            {
+                TableEntry::Occupied(occupied) => {
+                    let ptr = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
+                    unsafe { &*ptr }.inc_ref();
+                    ptr
+                }
+                TableEntry::Vacant(vacant) => {
+                    let owned_key: K = key.into();
+                    let state = State::new(owned_key, None, 1, hash);
+                    let ptr = &*state as *const State<K, V> as *mut State<K, V>;
+                    vacant.insert(state);
+                    ptr
+                }
             }
-            None => {
-                let state = State::new(None, 1);
-                let ptr = &*state as *const State<V> as *mut State<V>;
-                (UpdateAction::Replace(state), ptr)
-            }
-        });
-
-        self.guard_by_ref(ptr, key)
+        };
+        self.guard(ptr)
     }
 
     /// Gets the value associated with the given key.
     ///
     /// If other threads are currently accessing the key, this will wait
     /// until exclusive access is available before returning.
-    ///
-    /// # Arguments
-    /// * `key` - The key to look up
-    ///
-    /// # Returns
-    /// * `Some(V)` if the key exists
-    /// * `None` if the key doesn't exist
     ///
     /// # Performance Note
     ///
@@ -277,11 +362,12 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     /// **Locking behaviour:** Deadlock if called when holding the same entry.
     ///
     /// # Examples
+    ///
     /// ```
     /// use lockmap::LockMap;
     ///
     /// let map = LockMap::<String, u32>::new();
-    /// map.insert_by_ref("key", 42);
+    /// map.insert("key".to_string(), 42);
     /// assert_eq!(map.get("key"), Some(42));
     /// assert_eq!(map.get("missing"), None);
     /// ```
@@ -291,160 +377,151 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         V: Clone,
         Q: Eq + Hash + ?Sized,
     {
-        let mut ptr: *mut State<V> = std::ptr::null_mut();
-        let value = self.map.simple_update(key, |s| match s {
-            Some(state) => {
+        let hash = self.hasher.hash_one(key);
+        let shard = &self.shards[self.shard_index(hash)];
+        let mut ptr: *mut State<K, V> = std::ptr::null_mut();
+
+        let value = {
+            let inner = shard.inner.lock().unwrap();
+            let p = inner
+                .table
+                .find(hash, |s| s.key.borrow() == key)
+                .map(|s| &**s as *const State<K, V> as *mut State<K, V>)
+                .unwrap_or(std::ptr::null_mut());
+            if !p.is_null() {
+                let state = unsafe { &*p };
                 if state.flags().refcnt() == 0 {
-                    // SAFETY: We are inside the map's shard lock, and the reference count is 0,
-                    // meaning no other thread can be holding an `Entry` for this key.
-                    let value = unsafe { state.value_ref() }.clone();
-                    (SimpleAction::Keep, value)
+                    // SAFETY: refcnt == 0 means no Entry guard exists.
+                    unsafe { state.value_ref() }.clone()
                 } else {
                     state.inc_ref();
-                    ptr = &**state as *const State<V> as *mut State<V>;
-                    (SimpleAction::Keep, None)
+                    ptr = p;
+                    None
                 }
+            } else {
+                None
             }
-            None => (SimpleAction::Keep, None),
-        });
+        };
 
         if ptr.is_null() {
             return value;
         }
 
-        self.guard_by_ref(ptr, key).get().clone()
+        self.guard(ptr).get().clone()
     }
 
-    /// Sets a value in the map.
-    ///
-    /// If other threads are currently accessing the key, this will wait
-    /// until exclusive access is available before updating.
-    ///
-    /// # Arguments
-    /// * `key` - The key to update
-    /// * `value` - The value to set
+    /// Sets a value in the map, returning the previous value if any.
     ///
     /// **Locking behaviour:** Deadlock if called when holding the same entry.
     ///
     /// # Examples
+    ///
     /// ```
     /// use lockmap::LockMap;
     ///
     /// let map = LockMap::<String, u32>::new();
-    ///
-    /// // Set a value
     /// assert_eq!(map.insert("key".to_string(), 42), None);
-    ///
-    /// // Update existing value
     /// assert_eq!(map.insert("key".to_string(), 123), Some(42));
     /// ```
-    pub fn insert(&self, key: K, value: V) -> Option<V>
-    where
-        K: Clone,
-    {
-        let (ptr, value) = self.map.update(key.clone(), move |s| match s {
-            Some(state) => {
-                let flags = state.flags();
-                if flags.refcnt() == 0 {
-                    // SAFETY: We are inside the map's shard lock, and the reference count is 0,
-                    // meaning no other thread can be holding an `Entry` for this key.
-                    let value = unsafe { state.value_mut() }.replace(value);
-                    if !flags.has_value() {
+    pub fn insert(&self, key: K, value: V) -> Option<V> {
+        let hash = self.hasher.hash_one(&key);
+        let shard = &self.shards[self.shard_index(hash)];
+        let (ptr, old) = {
+            let mut inner = shard.inner.lock().unwrap();
+            match inner
+                .table
+                .entry(hash, |s| s.key.borrow() == &key, Self::state_hasher())
+            {
+                TableEntry::Occupied(occupied) => {
+                    let p = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
+                    let state = unsafe { &*p };
+                    let flags = state.flags();
+                    if flags.refcnt() == 0 {
+                        // SAFETY: refcnt == 0 → exclusive.
+                        let old = unsafe { state.value_mut() }.replace(value);
                         state.set_value_state(true);
+                        (std::ptr::null_mut(), old)
+                    } else {
+                        state.inc_ref();
+                        (p, Some(value))
                     }
-                    (UpdateAction::Keep, (std::ptr::null_mut(), value))
-                } else {
-                    state.inc_ref();
-                    let ptr: *mut State<V> = &**state as *const State<V> as *mut State<V>;
-                    (UpdateAction::Keep, (ptr, Some(value)))
+                }
+                TableEntry::Vacant(vacant) => {
+                    let state = State::new(key, Some(value), 0, hash);
+                    vacant.insert(state);
+                    (std::ptr::null_mut(), None)
                 }
             }
-            None => {
-                let state = State::new(Some(value), 0);
-                (UpdateAction::Replace(state), (std::ptr::null_mut(), None))
-            }
-        });
+        };
 
         if ptr.is_null() {
-            return value;
+            return old;
         }
 
-        self.guard_by_val(ptr, key).swap(value)
+        self.guard(ptr).swap(old)
     }
 
-    /// Sets a value in the map.
-    ///
-    /// If other threads are currently accessing the key, this will wait
-    /// until exclusive access is available before updating.
-    ///
-    /// # Arguments
-    /// * `key` - The key to update
-    /// * `value` - The value to set
+    /// Sets a value in the map by reference key.
     ///
     /// **Locking behaviour:** Deadlock if called when holding the same entry.
     ///
     /// # Examples
+    ///
     /// ```
     /// use lockmap::LockMap;
     ///
     /// let map = LockMap::<String, u32>::new();
-    ///
-    /// // Set a value
     /// map.insert_by_ref("key", 42);
-    ///
-    /// // Update existing value
-    /// map.insert_by_ref("key", 123);
+    /// assert_eq!(map.get("key"), Some(42));
     /// ```
     pub fn insert_by_ref<Q>(&self, key: &Q, value: V) -> Option<V>
     where
         K: Borrow<Q> + for<'c> From<&'c Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let (ptr, value) = self.map.update_by_ref(key, move |s| match s {
-            Some(state) => {
-                let flags = state.flags();
-                if flags.refcnt() == 0 {
-                    // SAFETY: We are inside the map's shard lock, and the reference count is 0,
-                    // meaning no other thread can be holding an `Entry` for this key.
-                    let value = unsafe { state.value_mut() }.replace(value);
-                    if !flags.has_value() {
+        let hash = self.hasher.hash_one(key);
+        let shard = &self.shards[self.shard_index(hash)];
+        let (ptr, old) = {
+            let mut inner = shard.inner.lock().unwrap();
+            match inner
+                .table
+                .entry(hash, |s| s.key.borrow() == key, Self::state_hasher())
+            {
+                TableEntry::Occupied(occupied) => {
+                    let p = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
+                    let state = unsafe { &*p };
+                    let flags = state.flags();
+                    if flags.refcnt() == 0 {
+                        let old = unsafe { state.value_mut() }.replace(value);
                         state.set_value_state(true);
+                        (std::ptr::null_mut(), old)
+                    } else {
+                        state.inc_ref();
+                        (p, Some(value))
                     }
-                    (UpdateAction::Keep, (std::ptr::null_mut(), value))
-                } else {
-                    state.inc_ref();
-                    let ptr: *mut State<V> = &**state as *const State<V> as *mut State<V>;
-                    (UpdateAction::Keep, (ptr, Some(value)))
+                }
+                TableEntry::Vacant(vacant) => {
+                    let owned_key: K = key.into();
+                    let state = State::new(owned_key, Some(value), 0, hash);
+                    vacant.insert(state);
+                    (std::ptr::null_mut(), None)
                 }
             }
-            None => {
-                let state = State::new(Some(value), 0);
-                (UpdateAction::Replace(state), (std::ptr::null_mut(), None))
-            }
-        });
+        };
 
         if ptr.is_null() {
-            return value;
+            return old;
         }
 
-        self.guard_by_ref(ptr, key).swap(value)
+        self.guard(ptr).swap(old)
     }
 
     /// Checks if the map contains a key.
     ///
-    /// If other threads are currently accessing the key, this will wait
-    /// until exclusive access is available before checking.
-    ///
-    /// # Arguments
-    /// * `key` - The key to check
-    ///
-    /// # Returns
-    /// * `true` if the key exists
-    /// * `false` if the key doesn't exist
-    ///
     /// **Locking behaviour:** Deadlock if called when holding the same entry.
     ///
     /// # Examples
+    ///
     /// ```
     /// use lockmap::LockMap;
     ///
@@ -458,49 +535,49 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let mut ptr: *mut State<V> = std::ptr::null_mut();
-        let value = self.map.simple_update(key, |s| match s {
-            Some(state) => {
+        let hash = self.hasher.hash_one(key);
+        let shard = &self.shards[self.shard_index(hash)];
+        let mut ptr: *mut State<K, V> = std::ptr::null_mut();
+
+        let found = {
+            let inner = shard.inner.lock().unwrap();
+            let p = inner
+                .table
+                .find(hash, |s| s.key.borrow() == key)
+                .map(|s| &**s as *const State<K, V> as *mut State<K, V>)
+                .unwrap_or(std::ptr::null_mut());
+            if !p.is_null() {
+                let state = unsafe { &*p };
                 if state.flags().refcnt() == 0 {
-                    // SAFETY: We are inside the map's shard lock, and the reference count is 0,
-                    // meaning no other thread can be holding an `Entry` for this key.
-                    (SimpleAction::Keep, unsafe { state.value_ref() }.is_some())
+                    unsafe { state.value_ref() }.is_some()
                 } else {
                     state.inc_ref();
-                    ptr = &**state as *const State<V> as *mut State<V>;
-                    (SimpleAction::Keep, false)
+                    ptr = p;
+                    false
                 }
+            } else {
+                false
             }
-            None => (SimpleAction::Keep, false),
-        });
+        };
 
         if ptr.is_null() {
-            return value;
+            return found;
         }
 
-        self.guard_by_ref(ptr, key).get().is_some()
+        self.guard(ptr).get().is_some()
     }
 
     /// Removes a key from the map.
     ///
-    /// If other threads are currently accessing the key, this will wait
-    /// until exclusive access is available before removing.
-    ///
-    /// # Arguments
-    /// * `key` - The key to remove
-    ///
-    /// # Returns
-    /// * `Some(V)` if the key exists
-    /// * `None` if the key doesn't exist
-    ///
     /// **Locking behaviour:** Deadlock if called when holding the same entry.
     ///
     /// # Examples
+    ///
     /// ```
     /// use lockmap::LockMap;
     ///
     /// let map = LockMap::<String, u32>::new();
-    /// map.insert_by_ref("key", 42);
+    /// map.insert("key".to_string(), 42);
     /// assert_eq!(map.remove("key"), Some(42));
     /// assert_eq!(map.get("key"), None);
     /// ```
@@ -509,51 +586,35 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let mut ptr: *mut State<V> = std::ptr::null_mut();
-        let value = self.map.simple_update(key, |s| match s {
-            Some(state) => {
-                if state.flags().refcnt() == 0 {
-                    // SAFETY: We are inside the map's shard lock, and the reference count is 0,
-                    // meaning no other thread can be holding an `Entry` for this key.
-                    let value = unsafe { state.value_mut() }.take();
-                    (SimpleAction::Remove, value)
-                } else {
+        let hash = self.hasher.hash_one(key);
+        let shard = &self.shards[self.shard_index(hash)];
+
+        let ptr = {
+            let mut inner = shard.inner.lock().unwrap();
+            match inner.table.find_entry(hash, |s| s.key.borrow() == key) {
+                Ok(occupied) => {
+                    let p = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
+                    let state = unsafe { &*p };
+                    if state.flags().refcnt() == 0 {
+                        // SAFETY: refcnt == 0 → exclusive.
+                        let value = unsafe { state.value_mut() }.take();
+                        let _ = occupied.remove();
+                        return value;
+                    }
                     state.inc_ref();
-                    ptr = &**state as *const State<V> as *mut State<V>;
-                    (SimpleAction::Keep, None)
+                    p
                 }
+                Err(_) => return None,
             }
-            None => (SimpleAction::Keep, None),
-        });
+        };
 
-        if ptr.is_null() {
-            return value;
-        }
-
-        self.guard_by_ref(ptr, key).remove()
+        self.guard(ptr).remove()
     }
 
     /// Acquires exclusive locks for a batch of keys in a deadlock-safe manner.
     ///
-    /// This function is designed to prevent deadlocks that can occur when multiple threads
-    /// try to acquire locks on the same set of keys in different orders. It achieves this
-    /// by taking a `BTreeSet` of keys, which ensures the keys are processed and locked
+    /// Takes a `BTreeSet` of keys, ensuring they are processed and locked
     /// in a consistent, sorted order across all threads.
-    ///
-    /// The function iterates through the sorted keys, acquiring an exclusive lock for each
-    /// key and its associated value. The returned `Vec` contains RAII guards, which
-    /// automatically release the locks when they are dropped.
-    ///
-    /// # Arguments
-    ///
-    /// * `keys` - The `BTreeSet` of keys to lock. The use of `BTreeSet` is crucial as it
-    ///   enforces a global, canonical locking order, thus preventing deadlocks.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec<EntryByVal<K, V>>` containing the RAII guards for each locked key.
-    ///
-    /// **Locking behaviour:** Deadlock if called when holding the same entry.
     ///
     /// # Examples
     ///
@@ -566,22 +627,17 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     /// map.insert(2, 200);
     /// map.insert(3, 300);
     ///
-    /// // Create a set of keys to lock. Note that the order in the set doesn't matter
-    /// // since BTreeSet will sort them.
     /// let mut keys = BTreeSet::new();
     /// keys.insert(3);
     /// keys.insert(1);
     /// keys.insert(2);
     ///
-    /// // Acquire locks for all keys in a deadlock-safe manner
     /// let mut locked_entries = map.batch_lock::<std::collections::HashMap<_, _>>(keys);
     ///
-    /// // The locks are held as long as `locked_entries` is in scope
     /// locked_entries.get_mut(&1).and_then(|entry| entry.insert(101));
     /// locked_entries.get_mut(&2).and_then(|entry| entry.insert(201));
     /// locked_entries.get_mut(&3).and_then(|entry| entry.insert(301));
     ///
-    /// // When `locked_entries` is dropped, all locks are released
     /// drop(locked_entries);
     ///
     /// assert_eq!(map.get(&1), Some(101));
@@ -591,68 +647,18 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     pub fn batch_lock<'a, M>(&'a self, keys: BTreeSet<K>) -> M
     where
         K: Clone,
-        M: FromIterator<(K, EntryByVal<'a, K, V>)>,
+        M: FromIterator<(K, Entry<'a, K, V>)>,
     {
         keys.into_iter()
             .map(|key| (key.clone(), self.entry(key)))
             .collect()
     }
 
-    /// Attempts to remove an entry from the map if it's no longer needed.
-    ///
-    /// An entry is considered no longer needed if its reference count is 0
-    /// and it contains no value.
-    fn try_remove_entry<Q>(&self, key: &Q)
-    where
-        K: Borrow<Q>,
-        Q: Eq + Hash + ?Sized,
-    {
-        self.map.simple_update(key, |value| match value {
-            Some(state) => {
-                // SAFETY: We are inside the map's shard lock. If the reference count is 0 here,
-                // then no `Entry` is currently held for this key, and no other thread
-                // can increment the reference count without first acquiring this same shard lock.
-                // Therefore, if the stored value is also `None`, it is safe to remove
-                // the entry from the map.
-                if state.flags().pending_cleanup() {
-                    (SimpleAction::Remove, ())
-                } else {
-                    (SimpleAction::Keep, ())
-                }
-            }
-            // The key might have been removed by another thread (e.g., via `remove`)
-            // between the reference count decrement and this call.
-            None => (SimpleAction::Keep, ()),
-        });
-    }
-
-    fn guard_by_val(&self, ptr: *mut State<V>, key: K) -> EntryByVal<'_, K, V> {
-        // SAFETY: The pointer `ptr` is valid because it was just retrieved from the map
-        // and its reference count was incremented, ensuring it won't be dropped.
-        // The `AliasableBox` in the map ensures the `State<V>` remains at a stable
-        // memory location.
+    fn guard(&self, ptr: *mut State<K, V>) -> Entry<'_, K, V> {
+        // SAFETY: ptr is valid (ref-counted) and stable (AliasableBox).
         unsafe { (*ptr).mutex.lock() };
-        EntryByVal {
+        Entry {
             map: self,
-            key,
-            state: ptr,
-        }
-    }
-
-    fn guard_by_ref<'a, 'b, Q>(
-        &'a self,
-        ptr: *mut State<V>,
-        key: &'b Q,
-    ) -> EntryByRef<'a, 'b, K, Q, V>
-    where
-        K: Borrow<Q>,
-        Q: Eq + Hash + ?Sized,
-    {
-        // SAFETY: Same as `guard_by_val`.
-        unsafe { (*ptr).mutex.lock() };
-        EntryByRef {
-            map: self,
-            key,
             state: ptr,
         }
     }
@@ -664,280 +670,144 @@ impl<K, V> std::fmt::Debug for LockMap<K, V> {
     }
 }
 
-/// An RAII guard providing exclusive access to a key-value pair in the `LockMap`.
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+/// An RAII guard providing exclusive access to a key-value pair in the [`LockMap`].
 ///
-/// When dropped, this type automatically unlocks the entry allowing other threads to access it.
+/// The key is obtained directly from the internal `State`, so there is no need
+/// for separate by-value / by-reference entry types.
 ///
-/// # Type Parameters
-/// * `'a` - Lifetime of the `LockMap`
-/// * `K` - Key type that must implement `Eq + Hash`
-/// * `V` - Value type
+/// When dropped, this type automatically unlocks the entry and may trigger
+/// cleanup of empty entries.
 ///
 /// # Examples
+///
 /// ```
 /// use lockmap::LockMap;
 ///
 /// let map = LockMap::new();
 /// {
-///     // Get exclusive access to an entry
 ///     let mut entry = map.entry("key");
-///
-///     // Modify the value
 ///     entry.insert(42);
-///
-///     // EntryByVal is automatically unlocked when dropped
 /// }
 /// ```
-pub struct EntryByVal<'a, K: Eq + Hash, V> {
+pub struct Entry<'a, K: Eq + Hash, V> {
     map: &'a LockMap<K, V>,
-    key: K,
-    state: *mut State<V>,
+    state: *mut State<K, V>,
 }
 
-impl<K: Eq + Hash, V> EntryByVal<'_, K, V> {
+// SAFETY: The guard holds a per-key mutex lock and a valid, ref-counted pointer.
+unsafe impl<K: Eq + Hash + Send, V: Send> Send for Entry<'_, K, V> {}
+unsafe impl<K: Eq + Hash + Send + Sync, V: Send + Sync> Sync for Entry<'_, K, V> {}
+
+impl<K: Eq + Hash, V> Entry<'_, K, V> {
     /// Returns a reference to the entry's key.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the key associated with this entry.
     pub fn key(&self) -> &K {
-        &self.key
+        // SAFETY: The state pointer is valid for the lifetime of this guard
+        // and the key is immutable.
+        unsafe { &(*self.state).key }
     }
 
     /// Returns a reference to the entry's value.
-    ///
-    /// # Returns
-    ///
-    /// A reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get(&self) -> &Option<V> {
-        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
         unsafe { (*self.state).value_ref() }
     }
 
     /// Returns a mutable reference to the entry's value.
-    ///
-    /// # Returns
-    ///
-    /// A mutable reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
     pub fn get_mut(&mut self) -> &mut Option<V> {
-        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
         unsafe { (*self.state).value_mut() }
     }
 
-    /// Sets the value of the entry, returning the old value if it existed.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - The new value to insert
-    ///
-    /// # Returns
-    ///
-    /// The previous value if the entry was occupied, or `None` if it was vacant.
+    /// Sets the value, returning the old value if any.
     pub fn insert(&mut self, value: V) -> Option<V> {
         self.get_mut().replace(value)
     }
 
-    /// Swaps the value of the entry with the provided value.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - The new value to swap in (wrapped in `Option`)
-    ///
-    /// # Returns
-    ///
-    /// The previous value of the entry.
+    /// Swaps the value with the provided one, returning the old value.
     pub fn swap(&mut self, mut value: Option<V>) -> Option<V> {
         std::mem::swap(self.get_mut(), &mut value);
         value
     }
 
-    /// Removes the value from the entry, returning it if it existed.
-    ///
-    /// # Returns
-    ///
-    /// The value that was stored in the entry, or `None` if the entry was vacant.
+    /// Removes the value, returning it if it existed.
     pub fn remove(&mut self) -> Option<V> {
-        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
         self.get_mut().take()
     }
 }
 
-impl<K: Eq + Hash + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for EntryByVal<'_, K, V> {
+impl<K: Eq + Hash + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Entry<'_, K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EntryByVal")
-            .field("key", &self.key)
+        f.debug_struct("Entry")
+            .field("key", self.key())
             .field("value", self.get())
             .finish()
     }
 }
 
-impl<K: Eq + Hash, V> Drop for EntryByVal<'_, K, V> {
+impl<K: Eq + Hash, V> Drop for Entry<'_, K, V> {
     fn drop(&mut self) {
-        // Update flags based on current value state
-        unsafe { &*self.state }.set_value_state(self.get().is_some());
+        // 1. Update value state flag
+        let has_value = self.get().is_some();
+        let state_ref = unsafe { &*self.state };
+        state_ref.set_value_state(has_value);
 
-        // SAFETY: The entry holds the lock on the `State`, so it is safe to unlock it.
-        unsafe { &*self.state }.mutex.unlock();
+        // 2. Unlock the entry's mutex
+        // SAFETY: We hold the lock (acquired in guard()).
+        unsafe { state_ref.mutex.unlock() };
 
-        // SAFETY: The pointer `self.state` remains valid here because the `EntryByVal`
-        // incremented the `State`'s reference count when it was created. While `self` is
-        // alive in this `drop` call, the reference count is therefore at least 1, and this
-        // `fetch_sub(1, ...)` is decrementing that last reference held by the entry. The
-        // `State` is only deallocated once its reference count reaches zero, which can only
-        // occur after this `fetch_sub` completes. Thus, dereferencing `self.state` to access
-        // the reference count is safe at this point.
-        let flags = unsafe { (*self.state).dec_ref() };
-        if flags.pending_cleanup() {
-            self.map.try_remove_entry(&self.key);
+        // 3. CAS loop to decrement reference count
+        let mut current = state_ref.flags.load(Ordering::Acquire);
+        loop {
+            let flags = StateFlags(current);
+
+            // If this is the last guard and no value, proceed to cleanup
+            if flags.refcnt() == 1 && !flags.has_value() {
+                break;
+            }
+
+            let new_flags = StateFlags::new(flags.refcnt() - 1, flags.has_value());
+            match state_ref.flags.compare_exchange_weak(
+                current,
+                new_flags.0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return, // Not last guard or still has value, return early
+                Err(actual) => current = actual,
+            }
+        }
+
+        // 4. Acquire shard lock using the stored hash (no re-hashing).
+        let shard_idx = self.map.shard_index(state_ref.hash);
+        let shard = &self.map.shards[shard_idx];
+        let mut inner = shard.inner.lock().unwrap();
+
+        // 5. Decrement reference count again; cleanup if needed
+        let final_flags = state_ref.dec_ref();
+        if final_flags.pending_cleanup() {
+            let state_ptr = self.state as *const State<K, V>;
+            if let Ok(entry) = inner
+                .table
+                .find_entry(state_ref.hash, |s| std::ptr::eq(&**s, state_ptr))
+            {
+                let _ = entry.remove();
+            }
         }
     }
 }
 
-/// An RAII guard providing exclusive access to a key-value pair in the `LockMap`.
-///
-/// When dropped, this type automatically unlocks the entry allowing other threads to access it.
-///
-/// # Type Parameters
-/// * `'a` - Lifetime of the `LockMap`
-/// * `'b` - Lifetime of the key reference
-/// * `K` - Key type that must implement `Eq + Hash`
-/// * `Q` - Query type that can be borrowed from `K`
-/// * `V` - Value type
-///
-/// # Examples
-/// ```
-/// use lockmap::LockMap;
-///
-/// let map = LockMap::<String, u32>::new();
-/// {
-///     // Get exclusive access to an entry
-///     let mut entry = map.entry_by_ref("key");
-///
-///     // Modify the value
-///     entry.insert(42);
-///
-///     // EntryByRef is automatically unlocked when dropped
-/// }
-/// ```
-pub struct EntryByRef<'a, 'b, K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> {
-    map: &'a LockMap<K, V>,
-    key: &'b Q,
-    state: *mut State<V>,
-}
-
-impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> EntryByRef<'_, '_, K, Q, V> {
-    /// Returns a reference to the entry's key.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the key associated with this entry.
-    pub fn key(&self) -> &Q {
-        self.key
-    }
-
-    /// Returns a reference to the entry's value.
-    ///
-    /// # Returns
-    ///
-    /// A reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
-    pub fn get(&self) -> &Option<V> {
-        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
-        unsafe { (*self.state).value_ref() }
-    }
-
-    /// Returns a mutable reference to the entry's value.
-    ///
-    /// # Returns
-    ///
-    /// A mutable reference to `Some(V)` if the entry has a value, or `None` if the entry is vacant.
-    pub fn get_mut(&mut self) -> &mut Option<V> {
-        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
-        unsafe { (*self.state).value_mut() }
-    }
-
-    /// Sets the value of the entry, returning the old value if it existed.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - The new value to insert
-    ///
-    /// # Returns
-    ///
-    /// The previous value if the entry was occupied, or `None` if it was vacant.
-    pub fn insert(&mut self, value: V) -> Option<V> {
-        self.get_mut().replace(value)
-    }
-
-    /// Swaps the value of the entry with the provided value.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - The new value to swap in (wrapped in `Option`)
-    ///
-    /// # Returns
-    ///
-    /// The previous value of the entry.
-    pub fn swap(&mut self, mut value: Option<V>) -> Option<V> {
-        std::mem::swap(self.get_mut(), &mut value);
-        value
-    }
-
-    /// Removes the value from the entry, returning it if it existed.
-    ///
-    /// # Returns
-    ///
-    /// The value that was stored in the entry, or `None` if the entry was vacant.
-    pub fn remove(&mut self) -> Option<V> {
-        // SAFETY: The entry holds the lock on the `State`, so it is safe to access the value.
-        self.get_mut().take()
-    }
-}
-
-impl<K, Q, V> std::fmt::Debug for EntryByRef<'_, '_, K, Q, V>
-where
-    K: Eq + Hash + Borrow<Q> + std::fmt::Debug,
-    Q: Eq + Hash + ?Sized + std::fmt::Debug,
-    V: std::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EntryByRef")
-            .field("key", &self.key)
-            .field("value", self.get())
-            .finish()
-    }
-}
-
-impl<K: Eq + Hash + Borrow<Q>, Q: Eq + Hash + ?Sized, V> Drop for EntryByRef<'_, '_, K, Q, V> {
-    fn drop(&mut self) {
-        // Update flags based on current value state
-        unsafe { &*self.state }.set_value_state(self.get().is_some());
-
-        // SAFETY: The entry holds the lock on the `State`, so it is safe to unlock it.
-        unsafe { &*self.state }.mutex.unlock();
-
-        // SAFETY: The pointer `self.state` remains valid here because the `EntryByRef`
-        // incremented the `State`'s reference count when it was created. While `self` is
-        // alive in this `drop` call, the reference count is therefore at least 1, and this
-        // `fetch_sub(1, ...)` is decrementing that last reference held by the entry. The
-        // `State` is only deallocated once its reference count reaches zero, which can only
-        // occur after this `fetch_sub` completes. Thus, dereferencing `self.state` to access
-        // the reference count is safe at this point.
-        let flags = unsafe { (*self.state).dec_ref() };
-        if flags.pending_cleanup() {
-            self.map.try_remove_entry(self.key);
-        }
-    }
-}
+// ===========================================================================
+// Tests
+// ===========================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        collections::HashMap,
-        sync::{
-            atomic::{AtomicU32, Ordering},
-            Arc,
-        },
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
     };
 
     #[test]
@@ -1126,7 +996,8 @@ mod tests {
                 std::thread::spawn(move || {
                     for _ in 0..N {
                         let keys = (0..3).map(|_| rand::random::<u32>() % 32).collect();
-                        let mut entries: HashMap<_, _> = lock_map.batch_lock(keys);
+                        let mut entries: std::collections::HashMap<_, _> =
+                            lock_map.batch_lock(keys);
                         for entry in entries.values_mut() {
                             assert!(entry.get().is_none());
                             entry.insert(1);
@@ -1203,9 +1074,7 @@ mod tests {
 
     #[test]
     fn test_lockmap_get_set_by_ref() {
-        let lock_map = Arc::new(LockMap::<String, u32>::with_capacity_and_shard_amount(
-            256, 16,
-        ));
+        let lock_map = Arc::new(LockMap::<String, u32>::with_capacity_and_shard_amount(256, 16));
         #[cfg(not(miri))]
         const N: usize = 1 << 18;
         #[cfg(miri)]

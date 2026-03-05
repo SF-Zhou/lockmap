@@ -1,13 +1,24 @@
-[workspace]
-members = [
-    "lockmap-core",
-    "lockmap",
-    "lockmap-lru",
-]
-resolver = "2"
+[package]
+name = "lockmap"
+version = "0.2.0"
+edition = "2021"
 
-[workspace.dependencies]
+authors = ["SF-Zhou <sfzhou.scut@gmail.com>"]
+homepage = "https://github.com/SF-Zhou/lockmap"
+repository = "https://github.com/SF-Zhou/lockmap"
+description = "A high-performance, thread-safe HashMap and LRU cache with fine-grained per-key locking."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
 aliasable = "0.1"
-atomic-wait = "1.1"
 foldhash = "0.2"
 hashbrown = "0.15"
+parking_lot = "0.12"
+
+[dev-dependencies]
+criterion = "0"
+rand = "0"
+
+[[bench]]
+name = "bench_lockmap"
+harness = false
