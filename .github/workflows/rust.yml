@@ -10,37 +10,67 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  test:
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        build:
-          - linux-x64
-          - linux-arm64
-          - macos-arm64
-          - windows-x64
-          - windows-arm64
         include:
-          - build: linux-x64
+          - name: linux-x64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - build: linux-arm64
+            tool: cargo
+            command: test
+          
+          - name: linux-arm64
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-          - build: macos-arm64
+            tool: cross
+            command: test
+            
+          - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
-          - build: windows-x64
+            tool: cargo
+            command: test
+            
+          - name: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-          - build: windows-arm64
+            tool: cargo
+            command: test
+            
+          - name: windows-arm64
             os: windows-latest
             target: aarch64-pc-windows-msvc
+            tool: cargo
+            command: build
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install llvm-tools
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Install cross (for cross-architecture testing)
+      if: matrix.tool == 'cross'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cross
+
+    - name: Execute ${{ matrix.command }}
+      run: ${{ matrix.tool }} ${{ matrix.command }} --target ${{ matrix.target }}
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         components: llvm-tools-preview
@@ -48,35 +78,26 @@ jobs:
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@v2
       with:
-        tool: cargo-llvm-cov,cargo-nextest
+        tool: cargo-llvm-cov
 
-    - name: Run tests
-      run: |
-        cargo llvm-cov nextest
-        cargo llvm-cov report --cobertura --output-path target/llvm-cov-target/cobertura.xml
+    - name: Generate coverage report
+      run: cargo llvm-cov --all-features --workspace --cobertura --output-path cobertura.xml
 
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         slug: SF-Zhou/lockmap
-        files: target/llvm-cov-target/cobertura.xml
-
-    - name: Upload test results to Codecov
-      uses: codecov/codecov-action@v5
-      with:
-        report_type: test_results
-        token: ${{ secrets.CODECOV_TOKEN }}
-        slug: SF-Zhou/lockmap
-        files: target/nextest/default/junit.xml
+        files: cobertura.xml
+        fail_ci_if_error: true
 
   miri:
+    name: Miri Test
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install nightly toolchain with Miri
+      - name: Install Miri on nightly
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
