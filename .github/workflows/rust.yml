@@ -10,13 +10,46 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: windows-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install llvm-tools
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Test
+      run: cargo test --target ${{ matrix.target }}
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         components: llvm-tools-preview
@@ -24,35 +57,26 @@ jobs:
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@v2
       with:
-        tool: cargo-llvm-cov,cargo-nextest
+        tool: cargo-llvm-cov
 
-    - name: Run tests
-      run: |
-        cargo llvm-cov nextest
-        cargo llvm-cov report --cobertura --output-path target/llvm-cov-target/cobertura.xml
+    - name: Generate coverage report
+      run: cargo llvm-cov --all-features --workspace --cobertura --output-path cobertura.xml
 
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         slug: SF-Zhou/lockmap
-        files: target/llvm-cov-target/cobertura.xml
-
-    - name: Upload test results to Codecov
-      uses: codecov/codecov-action@v5
-      with:
-        report_type: test_results
-        token: ${{ secrets.CODECOV_TOKEN }}
-        slug: SF-Zhou/lockmap
-        files: target/nextest/default/junit.xml
+        files: cobertura.xml
+        fail_ci_if_error: true
 
   miri:
+    name: Miri Test
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install nightly toolchain with Miri
+      - name: Install Miri on nightly
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
