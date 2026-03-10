@@ -809,8 +809,10 @@ pub struct LruEntry<'a, K: Eq + Hash, V> {
 }
 
 // SAFETY: The guard holds a per-key mutex lock and a valid, ref-counted pointer.
-unsafe impl<K: Eq + Hash + Send, V: Send> Send for LruEntry<'_, K, V> {}
-unsafe impl<K: Eq + Hash + Send + Sync, V: Send + Sync> Sync for LruEntry<'_, K, V> {}
+// LruEntry is intentionally !Send — like MutexGuard, it should not be moved across threads.
+// For Sync, only K: Sync and V: Sync are needed: sharing &LruEntry across threads only
+// requires shared references (&K, &Option<V>) to be safe to share, not ownership transfer.
+unsafe impl<K: Eq + Hash + Sync, V: Sync> Sync for LruEntry<'_, K, V> {}
 
 impl<K: Eq + Hash, V> LruEntry<'_, K, V> {
     /// Returns a reference to the entry's key.
@@ -1627,4 +1629,12 @@ mod tests {
             THREADS as u32 * OPS_PER_THREAD as u32
         );
     }
+
+    // Compile-time trait assertions: LruEntry must be !Send but Sync when K, V: Sync.
+    const _: () = {
+        fn assert_sync<T: Sync>() {}
+        fn assert_lru_entry_sync() {
+            assert_sync::<LruEntry<'_, String, String>>();
+        }
+    };
 }
