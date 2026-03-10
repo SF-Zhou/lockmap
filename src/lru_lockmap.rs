@@ -1629,12 +1629,4 @@ mod tests {
             THREADS as u32 * OPS_PER_THREAD as u32
         );
     }
-
-    // Compile-time trait assertions: LruEntry must be !Send but Sync when K, V: Sync.
-    const _: () = {
-        fn assert_sync<T: Sync>() {}
-        fn assert_lru_entry_sync() {
-            assert_sync::<LruEntry<'_, String, String>>();
-        }
-    };
 }

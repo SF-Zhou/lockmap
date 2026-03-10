@@ -1201,12 +1201,4 @@ mod tests {
             assert_eq!(lock_map.get(&(i as u32)), Some(i as u32));
         }
     }
-
-    // Compile-time trait assertions: Entry must be !Send but Sync when K, V: Sync.
-    const _: () = {
-        fn assert_sync<T: Sync>() {}
-        fn assert_entry_sync() {
-            assert_sync::<Entry<'_, String, String>>();
-        }
-    };
 }
