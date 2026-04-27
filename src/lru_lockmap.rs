@@ -408,6 +408,8 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
     /// no limit is enforced and eviction continues until the shard is within
     /// capacity or all candidates are exhausted.
     ///
+    /// A value of `0` is treated as `1`.
+    ///
     /// # Examples
     ///
     /// ```
@@ -1665,12 +1667,25 @@ mod tests {
 
     #[test]
     fn test_max_evict_default_unlimited() {
-        let cache = LruLockMap::<u32, u32>::with_options(2, 2, 1);
-        cache.insert(1, 10);
-        cache.insert(2, 20);
-        cache.insert(3, 30); // exceeds capacity, should evict both 1 and 2 if needed
-        // Default max_evict is usize::MAX, so eviction continues until within capacity
-        assert_eq!(cache.len(), 2);
+        let cache = LruLockMap::<u32, u32>::with_options(10, 10, 1);
+        for i in 0..5u32 {
+            cache.insert(i, i * 10);
+        }
+        assert_eq!(cache.len(), 5);
+
+        // Shrink max_size to 1 — now 4 entries over capacity
+        cache.set_max_size(1);
+
+        // Insert triggers eviction. Default max_evict=usize::MAX should evict all
+        // excess entries until within capacity (only the new entry remains).
+        cache.insert(5, 50);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&5), Some(50));
+        assert!(cache.get(&0).is_none());
+        assert!(cache.get(&1).is_none());
+        assert!(cache.get(&2).is_none());
+        assert!(cache.get(&3).is_none());
+        assert!(cache.get(&4).is_none());
     }
 
     #[test]
