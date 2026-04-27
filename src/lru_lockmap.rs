@@ -121,6 +121,7 @@ struct LruShardInner<K, V> {
     head: *mut State<K, V>,
     tail: *mut State<K, V>,
     max_size: usize,
+    max_evict: usize,
 }
 
 // SAFETY: The raw pointers (head, tail, prev, next) are only accessed while
@@ -134,6 +135,7 @@ impl<K, V> LruShardInner<K, V> {
             head: std::ptr::null_mut(),
             tail: std::ptr::null_mut(),
             max_size,
+            max_evict: usize::MAX,
         }
     }
 
@@ -208,7 +210,12 @@ impl<K, V> LruShardInner<K, V> {
     /// be evicted even though it is at the head of the list.
     fn try_evict(&mut self, current: *mut State<K, V>) {
         let mut cursor = self.tail;
-        while self.table.len() > self.max_size && !cursor.is_null() && cursor != current {
+        let mut evicted = 0;
+        while self.table.len() > self.max_size
+            && !cursor.is_null()
+            && cursor != current
+            && evicted < self.max_evict
+        {
             let prev = unsafe { *(*cursor).prev.get() };
             let state = unsafe { &*cursor };
 
@@ -224,6 +231,7 @@ impl<K, V> LruShardInner<K, V> {
                 let _ = entry.remove();
             }
 
+            evicted += 1;
             cursor = prev;
         }
     }
@@ -258,6 +266,10 @@ impl<K, V> LruShardMap<K, V> {
 
     fn set_max_size(&self, max_size: usize) {
         self.inner.lock().unwrap().max_size = max_size;
+    }
+
+    fn set_max_evict(&self, max_evict: usize) {
+        self.inner.lock().unwrap().max_evict = max_evict.max(1);
     }
 }
 
@@ -387,6 +399,27 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         let per_shard_max_size = max_size.div_ceil(self.shards.len());
         for shard in &self.shards {
             shard.set_max_size(per_shard_max_size);
+        }
+    }
+
+    /// Sets the maximum number of entries that can be evicted in a single `try_evict` call.
+    ///
+    /// The limit is applied **per shard**. The default is `usize::MAX`, meaning
+    /// no limit is enforced and eviction continues until the shard is within
+    /// capacity or all candidates are exhausted.
+    ///
+    /// A value of `0` is treated as `1`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap::LruLockMap;
+    /// let cache = LruLockMap::<u32, u32>::with_options(10, 10, 1);
+    /// cache.set_max_evict(3);
+    /// ```
+    pub fn set_max_evict(&self, max_evict: usize) {
+        for shard in &self.shards {
+            shard.set_max_evict(max_evict);
         }
     }
 
@@ -1628,5 +1661,99 @@ mod tests {
             counter.load(Ordering::Relaxed),
             THREADS as u32 * OPS_PER_THREAD as u32
         );
+    }
+
+    // --- max_evict ---
+
+    #[test]
+    fn test_max_evict_default_unlimited() {
+        let cache = LruLockMap::<u32, u32>::with_options(10, 10, 1);
+        for i in 0..5u32 {
+            cache.insert(i, i * 10);
+        }
+        assert_eq!(cache.len(), 5);
+
+        // Shrink max_size to 1 — now 4 entries over capacity
+        cache.set_max_size(1);
+
+        // Insert triggers eviction. Default max_evict=usize::MAX should evict all
+        // excess entries until within capacity (only the new entry remains).
+        cache.insert(5, 50);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&5), Some(50));
+        assert!(cache.get(&0).is_none());
+        assert!(cache.get(&1).is_none());
+        assert!(cache.get(&2).is_none());
+        assert!(cache.get(&3).is_none());
+        assert!(cache.get(&4).is_none());
+    }
+
+    #[test]
+    fn test_max_evict_limited() {
+        let cache = LruLockMap::<u32, u32>::with_options(2, 2, 1);
+        cache.set_max_evict(1);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+
+        // Insert key 3, max_size=2 so we need to evict. max_evict=1 means only 1 can be evicted.
+        cache.insert(3, 30);
+        // Only key 1 (LRU) should be evicted, key 2 and 3 remain
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), Some(20));
+        assert_eq!(cache.get(&3), Some(30));
+    }
+
+    #[test]
+    fn test_max_evict_zero_treated_as_one() {
+        let cache = LruLockMap::<u32, u32>::with_options(2, 2, 1);
+        cache.set_max_evict(0); // should be treated as 1
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        cache.insert(3, 30);
+        assert_eq!(cache.get(&1), None); // key 1 evicted
+        assert_eq!(cache.get(&2), Some(20));
+        assert_eq!(cache.get(&3), Some(30));
+    }
+
+    #[test]
+    fn test_max_evict_still_respects_in_use() {
+        let cache = LruLockMap::<u32, u32>::with_options(1, 1, 1);
+        cache.set_max_evict(1);
+        cache.insert(1, 10);
+
+        let _entry = cache.entry(1); // refcnt > 0, cannot be evicted
+
+        cache.insert(2, 20); // need to evict key 1 but it's in use, and max_evict=1
+        assert_eq!(*_entry.get(), Some(10)); // key 1 still present (in use)
+        assert_eq!(cache.get(&2), Some(20));
+    }
+
+    #[test]
+    fn test_max_evict_after_shrinking_capacity() {
+        let cache = LruLockMap::<u32, u32>::with_options(10, 10, 1);
+        for i in 0..5u32 {
+            cache.insert(i, i * 10);
+        }
+        assert_eq!(cache.len(), 5);
+
+        // Shrink max_size: 5 entries but max_size=2 → 3 slots over capacity
+        cache.set_max_size(2);
+        cache.set_max_evict(2);
+
+        // Insert triggers eviction, but only up to max_evict=2
+        cache.insert(5, 50);
+
+        // 5 initial + 1 new - 2 evicted = 4 remaining
+        assert_eq!(cache.len(), 4);
+
+        // LRU entries 0 and 1 should be evicted
+        assert_eq!(cache.get(&0), None);
+        assert_eq!(cache.get(&1), None);
+
+        // Remaining entries should still be present
+        assert!(cache.get(&2).is_some());
+        assert!(cache.get(&3).is_some());
+        assert!(cache.get(&4).is_some());
+        assert_eq!(cache.get(&5), Some(50));
     }
 }
