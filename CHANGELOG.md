@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not promote entries)
 - Add `or_insert` / `or_insert_with` to `Entry` and `LruEntry`
 - Add `batch_lock` to `LruLockMap` for deadlock-safe multi-key locking
+- Add a comparison benchmark suite against `dashmap` and `moka`
+  (`cargo bench --bench bench_compare`)
 
 ### Changed
 

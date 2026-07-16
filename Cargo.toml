@@ -21,8 +21,14 @@ parking_lot = "0.12"
 
 [dev-dependencies]
 criterion = "0.8"
+dashmap = "6"
+moka = { version = "0.12", features = ["sync"] }
 rand = "0.10"
 
 [[bench]]
 name = "bench_lockmap"
+harness = false
+
+[[bench]]
+name = "bench_compare"
 harness = false

@@ -132,6 +132,24 @@ assert_eq!(cache.pop_lru(), Some(("key".to_string(), "new_value".to_string())));
 // entries are automatically evicted.
 ```
 
+## Benchmarks
+
+The repository ships two Criterion benchmark suites:
+
+```bash
+cargo bench --bench bench_lockmap   # multi-threaded workloads for LockMap / LruLockMap
+cargo bench --bench bench_compare   # comparison against dashmap and moka
+```
+
+The comparison suite normalizes semantics where the crates differ (see the
+fairness notes in `benches/bench_compare.rs`). Rough expectations: `LockMap`
+trades a little single-thread overhead for per-key exclusive access — under
+short critical sections `DashMap`'s shard lock is faster on hot keys, while
+`LockMap` scales better on mixed/read workloads and never blocks unrelated keys
+while an entry is held. `moka` maintains hit-rate-oriented bookkeeping (TinyLFU)
+and targets a different trade-off than `LruLockMap`'s raw-throughput sharded LRU;
+run the suite on your own hardware and workload before drawing conclusions.
+
 ## Important Caveats
 
 ### 1. No Lock Poisoning
