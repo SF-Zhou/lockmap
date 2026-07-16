@@ -18,6 +18,7 @@
 //! - **Single hash computation**: Key and pre-computed hash stored together; each operation hashes once
 //! - **No key duplication**: Uses [`hashbrown::HashTable`] so each key is stored only once
 //! - **Deadlock prevention**: `LockMap` provides [`batch_lock`](LockMap::batch_lock) for safe multi-key locking
+//! - **Non-blocking locking**: [`try_entry`](LockMap::try_entry) returns `None` instead of blocking when a key is held
 //! - **LRU eviction**: `LruLockMap` automatically evicts least recently used entries when capacity is exceeded
 //! - **Non-blocking eviction**: In-use entries are skipped during eviction; traversal continues to the next candidate
 //!
@@ -59,9 +60,14 @@
 //! assert_eq!(cache.remove("key"), Some(42));
 //! ```
 
-#[doc = include_str!("../README.md")]
+mod common;
 mod lockmap;
 mod lru_lockmap;
 
 pub use lockmap::{Entry, LockMap};
 pub use lru_lockmap::{LruEntry, LruLockMap};
+
+/// Runs the code examples in `README.md` as documentation tests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

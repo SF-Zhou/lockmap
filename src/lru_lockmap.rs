@@ -1,45 +1,14 @@
+use crate::common::{default_shard_amount, StateFlags};
 use aliasable::boxed::AliasableBox;
 use foldhash::fast::RandomState;
 use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
 use parking_lot::lock_api::RawMutex as _;
-use parking_lot::RawMutex;
+use parking_lot::{Mutex, RawMutex};
 use std::borrow::Borrow;
 use std::cell::UnsafeCell;
 use std::hash::{BuildHasher, Hash};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
-
-// ---------------------------------------------------------------------------
-// StateFlags (same design as lockmap)
-// ---------------------------------------------------------------------------
-
-struct StateFlags(u32);
-
-impl StateFlags {
-    const HAS_VALUE_FLAG: u32 = 1 << 31;
-    const REFCNT_MASK: u32 = !Self::HAS_VALUE_FLAG;
-
-    fn new(refcnt: u32, has_value: bool) -> Self {
-        let mut val = refcnt & Self::REFCNT_MASK;
-        if has_value {
-            val |= Self::HAS_VALUE_FLAG;
-        }
-        Self(val)
-    }
-
-    fn refcnt(&self) -> u32 {
-        self.0 & Self::REFCNT_MASK
-    }
-
-    fn has_value(&self) -> bool {
-        (self.0 & Self::HAS_VALUE_FLAG) != 0
-    }
-
-    fn pending_cleanup(&self) -> bool {
-        self.0 == 0
-    }
-}
 
 // ---------------------------------------------------------------------------
 // State – per-key state with intrusive LRU list pointers
@@ -52,7 +21,7 @@ struct State<K, V> {
     mutex: RawMutex,
     value: UnsafeCell<Option<V>>,
     // Intrusive doubly-linked list pointers for LRU ordering.
-    // These are only accessed while the shard's `std::sync::Mutex` is held.
+    // These are only accessed while the shard's `parking_lot::Mutex` is held.
     prev: UnsafeCell<*mut Self>,
     next: UnsafeCell<*mut Self>,
 }
@@ -74,8 +43,19 @@ impl<K, V> State<K, V> {
         StateFlags(self.flags.load(Ordering::Acquire))
     }
 
+    /// Increments the reference count.
+    ///
+    /// # Note
+    ///
+    /// The reference count uses 31 bits, supporting up to 2^31 - 1 concurrent
+    /// references. Overflow is checked in debug builds only.
     fn inc_ref(&self) -> StateFlags {
-        StateFlags(self.flags.fetch_add(1, Ordering::AcqRel) + 1)
+        let old = self.flags.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(
+            StateFlags(old).refcnt() < StateFlags::REFCNT_MASK,
+            "lockmap: reference count overflow"
+        );
+        StateFlags(old + 1)
     }
 
     fn dec_ref(&self) -> StateFlags {
@@ -125,7 +105,7 @@ struct LruShardInner<K, V> {
 }
 
 // SAFETY: The raw pointers (head, tail, prev, next) are only accessed while
-// the shard's `std::sync::Mutex` is held, ensuring exclusive access.
+// the shard's `parking_lot::Mutex` is held, ensuring exclusive access.
 unsafe impl<K: Send, V: Send> Send for LruShardInner<K, V> {}
 
 impl<K, V> LruShardInner<K, V> {
@@ -242,34 +222,34 @@ impl<K, V> LruShardInner<K, V> {
 // ---------------------------------------------------------------------------
 
 struct LruShardMap<K, V> {
-    inner: std::sync::Mutex<LruShardInner<K, V>>,
+    inner: Mutex<LruShardInner<K, V>>,
 }
 
 impl<K, V> LruShardMap<K, V> {
     fn with_capacity(max_size: usize, capacity: usize) -> Self {
         Self {
-            inner: std::sync::Mutex::new(LruShardInner::with_capacity(max_size, capacity)),
+            inner: Mutex::new(LruShardInner::with_capacity(max_size, capacity)),
         }
     }
 
     fn len(&self) -> usize {
-        self.inner.lock().unwrap().table.len()
+        self.inner.lock().table.len()
     }
 
     fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().table.is_empty()
+        self.inner.lock().table.is_empty()
     }
 
     fn max_size(&self) -> usize {
-        self.inner.lock().unwrap().max_size
+        self.inner.lock().max_size
     }
 
     fn set_max_size(&self, max_size: usize) {
-        self.inner.lock().unwrap().max_size = max_size;
+        self.inner.lock().max_size = max_size;
     }
 
     fn set_max_evict(&self, max_evict: usize) {
-        self.inner.lock().unwrap().max_evict = max_evict.max(1);
+        self.inner.lock().max_evict = max_evict.max(1);
     }
 }
 
@@ -318,13 +298,6 @@ pub struct LruLockMap<K, V> {
     hasher: RandomState,
 }
 
-fn default_shard_amount() -> usize {
-    static DEFAULT_SHARD_AMOUNT: OnceLock<usize> = OnceLock::new();
-    *DEFAULT_SHARD_AMOUNT.get_or_init(|| {
-        (std::thread::available_parallelism().map_or(1, usize::from) * 4).next_power_of_two()
-    })
-}
-
 impl<K: Eq + Hash, V> LruLockMap<K, V> {
     /// Creates a new `LruLockMap` with the given total capacity.
     ///
@@ -363,7 +336,8 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
     /// This is the total logical capacity across all shards, computed from the
     /// per‑shard limits. The per‑shard limit is derived using
     /// `max_size.div_ceil(shard_amount)`, so the effective total capacity may be
-    /// rounded up compared to the value originally passed to [`with_options`].
+    /// rounded up compared to the value originally passed to
+    /// [`with_options`](Self::with_options).
     ///
     /// # Examples
     ///
@@ -458,33 +432,59 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
     /// }
     /// ```
     pub fn entry(&self, key: K) -> LruEntry<'_, K, V> {
+        let ptr = self.acquire_state(key);
+        self.guard(ptr)
+    }
+
+    /// Attempts to get exclusive access to an entry without blocking.
+    ///
+    /// Returns `None` if another thread currently holds the entry for this key.
+    /// Unlike [`entry`](Self::entry), this method never blocks on the per-key
+    /// lock (it may still wait briefly on the internal shard lock). The key is
+    /// promoted in the LRU list even if `None` is returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap::LruLockMap;
+    /// let cache = LruLockMap::<String, u32>::new(100);
+    /// let entry = cache.entry("key".to_string());
+    /// // The key is held by `entry`, so `try_entry` fails:
+    /// assert!(cache.try_entry("key".to_string()).is_none());
+    /// drop(entry);
+    /// assert!(cache.try_entry("key".to_string()).is_some());
+    /// ```
+    pub fn try_entry(&self, key: K) -> Option<LruEntry<'_, K, V>> {
+        let ptr = self.acquire_state(key);
+        self.try_guard(ptr)
+    }
+
+    /// Acquires (or creates) the state for `key`, incrementing its reference
+    /// count, promoting it in the LRU list and triggering eviction if needed.
+    fn acquire_state(&self, key: K) -> *mut State<K, V> {
         let hash = self.hasher.hash_one(&key);
         let shard = &self.shards[self.shard_index(hash)];
-        let ptr: *mut State<K, V> = {
-            let mut inner = shard.inner.lock().unwrap();
-            let ptr =
-                match inner
-                    .table
-                    .entry(hash, |s| s.key.borrow() == &key, Self::state_hasher())
-                {
-                    Entry::Occupied(occupied) => {
-                        let ptr = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
-                        unsafe { &*ptr }.inc_ref();
-                        unsafe { inner.move_to_front(ptr) };
-                        ptr
-                    }
-                    Entry::Vacant(vacant) => {
-                        let state = State::new(key, None, 1, hash);
-                        let ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                        vacant.insert(state);
-                        unsafe { inner.push_front(ptr) };
-                        ptr
-                    }
-                };
-            inner.try_evict(ptr);
-            ptr
+        let mut inner = shard.inner.lock();
+        let ptr = match inner
+            .table
+            .entry(hash, |s| s.key.borrow() == &key, Self::state_hasher())
+        {
+            Entry::Occupied(occupied) => {
+                let ptr = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
+                unsafe { &*ptr }.inc_ref();
+                unsafe { inner.move_to_front(ptr) };
+                ptr
+            }
+            Entry::Vacant(vacant) => {
+                let state = State::new(key, None, 1, hash);
+                let ptr = &*state as *const State<K, V> as *mut State<K, V>;
+                vacant.insert(state);
+                unsafe { inner.push_front(ptr) };
+                ptr
+            }
         };
-        self.guard(ptr)
+        inner.try_evict(ptr);
+        ptr
     }
 
     /// Gets exclusive access to an entry by reference.
@@ -506,33 +506,66 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         K: Borrow<Q> + for<'c> From<&'c Q>,
         Q: Eq + Hash + ?Sized,
     {
+        let ptr = self.acquire_state_by_ref(key);
+        self.guard(ptr)
+    }
+
+    /// Attempts to get exclusive access to an entry by reference without blocking.
+    ///
+    /// Returns `None` if another thread currently holds the entry for this key.
+    /// Unlike [`entry_by_ref`](Self::entry_by_ref), this method never blocks on
+    /// the per-key lock (it may still wait briefly on the internal shard lock).
+    /// The key is promoted in the LRU list even if `None` is returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap::LruLockMap;
+    /// let cache = LruLockMap::<String, u32>::new(100);
+    /// let entry = cache.entry_by_ref("key");
+    /// assert!(cache.try_entry_by_ref("key").is_none());
+    /// drop(entry);
+    /// assert!(cache.try_entry_by_ref("key").is_some());
+    /// ```
+    pub fn try_entry_by_ref<Q>(&self, key: &Q) -> Option<LruEntry<'_, K, V>>
+    where
+        K: Borrow<Q> + for<'c> From<&'c Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        let ptr = self.acquire_state_by_ref(key);
+        self.try_guard(ptr)
+    }
+
+    /// By-reference variant of [`acquire_state`](Self::acquire_state).
+    fn acquire_state_by_ref<Q>(&self, key: &Q) -> *mut State<K, V>
+    where
+        K: Borrow<Q> + for<'c> From<&'c Q>,
+        Q: Eq + Hash + ?Sized,
+    {
         let hash = self.hasher.hash_one(key);
         let shard = &self.shards[self.shard_index(hash)];
-        let ptr: *mut State<K, V> = {
-            let mut inner = shard.inner.lock().unwrap();
-            let ptr = match inner
-                .table
-                .entry(hash, |s| s.key.borrow() == key, Self::state_hasher())
-            {
-                Entry::Occupied(occupied) => {
-                    let ptr = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
-                    unsafe { &*ptr }.inc_ref();
-                    unsafe { inner.move_to_front(ptr) };
-                    ptr
-                }
-                Entry::Vacant(vacant) => {
-                    let owned_key: K = key.into();
-                    let state = State::new(owned_key, None, 1, hash);
-                    let ptr = &*state as *const State<K, V> as *mut State<K, V>;
-                    vacant.insert(state);
-                    unsafe { inner.push_front(ptr) };
-                    ptr
-                }
-            };
-            inner.try_evict(ptr);
-            ptr
+        let mut inner = shard.inner.lock();
+        let ptr = match inner
+            .table
+            .entry(hash, |s| s.key.borrow() == key, Self::state_hasher())
+        {
+            Entry::Occupied(occupied) => {
+                let ptr = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
+                unsafe { &*ptr }.inc_ref();
+                unsafe { inner.move_to_front(ptr) };
+                ptr
+            }
+            Entry::Vacant(vacant) => {
+                let owned_key: K = key.into();
+                let state = State::new(owned_key, None, 1, hash);
+                let ptr = &*state as *const State<K, V> as *mut State<K, V>;
+                vacant.insert(state);
+                unsafe { inner.push_front(ptr) };
+                ptr
+            }
         };
-        self.guard(ptr)
+        inner.try_evict(ptr);
+        ptr
     }
 
     /// Gets the value associated with the given key.
@@ -561,7 +594,7 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         let mut ptr: *mut State<K, V> = std::ptr::null_mut();
 
         let value = {
-            let mut inner = shard.inner.lock().unwrap();
+            let mut inner = shard.inner.lock();
             let p = inner
                 .table
                 .find(hash, |s| s.key.borrow() == key)
@@ -607,7 +640,7 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         let hash = self.hasher.hash_one(&key);
         let shard = &self.shards[self.shard_index(hash)];
         let (ptr, old) = {
-            let mut inner = shard.inner.lock().unwrap();
+            let mut inner = shard.inner.lock();
             match inner
                 .table
                 .entry(hash, |s| s.key.borrow() == &key, Self::state_hasher())
@@ -665,7 +698,7 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         let hash = self.hasher.hash_one(key);
         let shard = &self.shards[self.shard_index(hash)];
         let (ptr, old) = {
-            let mut inner = shard.inner.lock().unwrap();
+            let mut inner = shard.inner.lock();
             match inner
                 .table
                 .entry(hash, |s| s.key.borrow() == key, Self::state_hasher())
@@ -728,7 +761,7 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         let mut ptr: *mut State<K, V> = std::ptr::null_mut();
 
         let found = {
-            let mut inner = shard.inner.lock().unwrap();
+            let mut inner = shard.inner.lock();
             let p = inner
                 .table
                 .find(hash, |s| s.key.borrow() == key)
@@ -779,7 +812,7 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         let shard = &self.shards[self.shard_index(hash)];
 
         let ptr = {
-            let mut inner = shard.inner.lock().unwrap();
+            let mut inner = shard.inner.lock();
             let p = match inner.table.find_entry(hash, |s| s.key.borrow() == key) {
                 Ok(occupied) => {
                     let p = &**occupied.get() as *const State<K, V> as *mut State<K, V>;
@@ -803,12 +836,125 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         self.guard(ptr).remove()
     }
 
+    /// Removes all key-value pairs from the cache.
+    ///
+    /// Entries that are currently held by an [`LruEntry`] guard are cleared by
+    /// waiting for the guard to be released, exactly as [`remove`](Self::remove)
+    /// would.
+    ///
+    /// **Locking behaviour:** Deadlock if called when holding any entry of this cache.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap::LruLockMap;
+    /// let cache = LruLockMap::<String, u32>::new(100);
+    /// cache.insert("a".to_string(), 1);
+    /// cache.insert("b".to_string(), 2);
+    /// cache.clear();
+    /// assert!(cache.is_empty());
+    /// ```
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            let mut in_use: Vec<*mut State<K, V>> = Vec::new();
+            {
+                let mut inner = shard.inner.lock();
+                let mut cursor = inner.head;
+                while !cursor.is_null() {
+                    // SAFETY: cursor is a valid node of this shard's list; the
+                    // shard mutex is held. `next` is read before any removal.
+                    let next = unsafe { *(*cursor).next.get() };
+                    let state = unsafe { &*cursor };
+                    if state.flags().refcnt() == 0 {
+                        // SAFETY: refcnt == 0 → no guard exists; safe to drop.
+                        let hash = state.hash;
+                        unsafe { inner.detach(cursor) };
+                        if let Ok(entry) =
+                            inner.table.find_entry(hash, |s| std::ptr::eq(&**s, cursor))
+                        {
+                            let _ = entry.remove();
+                        }
+                    } else {
+                        state.inc_ref();
+                        in_use.push(cursor);
+                    }
+                    cursor = next;
+                }
+            }
+            // For in-use entries, wait for the holders and remove the values.
+            for ptr in in_use {
+                self.guard(ptr).remove();
+            }
+        }
+    }
+
     fn guard(&self, ptr: *mut State<K, V>) -> LruEntry<'_, K, V> {
         // SAFETY: ptr is valid (ref-counted) and stable (AliasableBox).
         unsafe { (*ptr).mutex.lock() };
         LruEntry {
             map: self,
             state: ptr,
+        }
+    }
+
+    fn try_guard(&self, ptr: *mut State<K, V>) -> Option<LruEntry<'_, K, V>> {
+        // SAFETY: ptr is valid (ref-counted) and stable (AliasableBox).
+        if unsafe { (*ptr).mutex.try_lock() } {
+            Some(LruEntry {
+                map: self,
+                state: ptr,
+            })
+        } else {
+            self.release_ref(ptr);
+            None
+        }
+    }
+
+    /// Releases one reference to `state`; if this was the last reference and
+    /// the entry holds no value, the entry is detached from the LRU list and
+    /// removed from its shard.
+    ///
+    /// The per-key mutex must NOT be held by the caller.
+    fn release_ref(&self, state: *mut State<K, V>) {
+        let state_ref = unsafe { &*state };
+
+        // CAS loop to decrement the reference count.
+        let mut current = state_ref.flags.load(Ordering::Acquire);
+        loop {
+            let flags = StateFlags(current);
+
+            // If this is the last reference and no value, proceed to cleanup.
+            if flags.refcnt() == 1 && !flags.has_value() {
+                break;
+            }
+
+            let new_flags = StateFlags::new(flags.refcnt() - 1, flags.has_value());
+            match state_ref.flags.compare_exchange_weak(
+                current,
+                new_flags.0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return, // Not the last reference or still has value.
+                Err(actual) => current = actual,
+            }
+        }
+
+        // Acquire shard lock using the stored hash (no re-hashing).
+        let shard = &self.shards[self.shard_index(state_ref.hash)];
+        let mut inner = shard.inner.lock();
+
+        // Decrement the reference count again; cleanup if needed.
+        let final_flags = state_ref.dec_ref();
+        if final_flags.pending_cleanup() {
+            unsafe { inner.detach(state) };
+            let state_ptr = state as *const State<K, V>;
+            if let Ok(entry) = inner
+                .table
+                .find_entry(state_ref.hash, |s| std::ptr::eq(&**s, state_ptr))
+            {
+                let _ = entry.remove();
+            }
         }
     }
 }
@@ -900,45 +1046,9 @@ impl<K: Eq + Hash, V> Drop for LruEntry<'_, K, V> {
         // SAFETY: We hold the lock (acquired in guard()).
         unsafe { state_ref.mutex.unlock() };
 
-        // 3. CAS loop to decrement reference count
-        let mut current = state_ref.flags.load(Ordering::Acquire);
-        loop {
-            let flags = StateFlags(current);
-
-            // If this is the last guard and no value, proceed to cleanup
-            if flags.refcnt() == 1 && !flags.has_value() {
-                break;
-            }
-
-            let new_flags = StateFlags::new(flags.refcnt() - 1, flags.has_value());
-            match state_ref.flags.compare_exchange_weak(
-                current,
-                new_flags.0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return, // Not last guard or still has value, return early
-                Err(actual) => current = actual,
-            }
-        }
-
-        // 4. Acquire shard lock using the stored hash (no re-hashing).
-        let shard_idx = self.map.shard_index(state_ref.hash);
-        let shard = &self.map.shards[shard_idx];
-        let mut inner = shard.inner.lock().unwrap();
-
-        // 5. Decrement reference count again; cleanup if needed
-        let final_flags = state_ref.dec_ref();
-        if final_flags.pending_cleanup() {
-            unsafe { inner.detach(self.state) };
-            let state_ptr = self.state as *const State<K, V>;
-            if let Ok(entry) = inner
-                .table
-                .find_entry(state_ref.hash, |s| std::ptr::eq(&**s, state_ptr))
-            {
-                let _ = entry.remove();
-            }
-        }
+        // 3. Release the reference; detaches and removes the entry if it is
+        //    the last reference and no value is stored.
+        self.map.release_ref(self.state);
     }
 }
 
@@ -1755,5 +1865,91 @@ mod tests {
         assert!(cache.get(&3).is_some());
         assert!(cache.get(&4).is_some());
         assert_eq!(cache.get(&5), Some(50));
+    }
+
+    // --- try_entry / clear ---
+
+    #[test]
+    fn test_lru_try_entry() {
+        let cache = LruLockMap::<String, u32>::new(100);
+        {
+            let mut entry = cache.try_entry("key".to_string()).unwrap();
+            entry.insert(1);
+            assert!(cache.try_entry("key".to_string()).is_none());
+            assert!(cache.try_entry_by_ref("key").is_none());
+        }
+        assert_eq!(cache.get("key"), Some(1));
+        {
+            let mut entry = cache.try_entry_by_ref("key").unwrap();
+            assert_eq!(entry.remove(), Some(1));
+        }
+        // A failed try_entry on a held, empty key must not leak the entry.
+        let held = cache.entry("held".to_string());
+        assert!(cache.try_entry("held".to_string()).is_none());
+        drop(held);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_lru_try_entry_promotes() {
+        let cache = LruLockMap::<u32, u32>::with_options(3, 3, 1);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        cache.insert(3, 30);
+
+        // Promote key=1 via try_entry.
+        assert!(cache.try_entry(1).is_some());
+
+        cache.insert(4, 40);
+        assert_eq!(cache.get(&2), None); // evicted
+        assert_eq!(cache.get(&1), Some(10)); // promoted
+    }
+
+    #[test]
+    fn test_lru_clear() {
+        let cache = LruLockMap::<u32, u32>::with_options(3, 3, 1);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        cache.insert(3, 30);
+        cache.clear();
+        assert!(cache.is_empty());
+
+        // The LRU list must remain consistent after clear: eviction still works.
+        cache.insert(4, 40);
+        cache.insert(5, 50);
+        cache.insert(6, 60);
+        cache.insert(7, 70);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get(&4), None); // evicted
+        assert_eq!(cache.get(&5), Some(50));
+        assert_eq!(cache.get(&6), Some(60));
+        assert_eq!(cache.get(&7), Some(70));
+
+        // Clearing an empty cache is a no-op.
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_lru_clear_with_held_entry() {
+        let cache = Arc::new(LruLockMap::<u32, u32>::new(100));
+        cache.insert(1, 10);
+
+        let mut held = cache.entry(2);
+        held.insert(20);
+
+        let cleaner = {
+            let cache = cache.clone();
+            std::thread::spawn(move || cache.clear())
+        };
+
+        // Give the cleaner a chance to reach the held entry, then release it.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(held);
+        cleaner.join().unwrap();
+
+        assert!(cache.is_empty());
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), None);
     }
 }
