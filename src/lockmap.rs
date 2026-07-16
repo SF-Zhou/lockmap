@@ -161,14 +161,14 @@ impl<K, V> ShardMap<K, V> {
 /// assert_eq!(map.remove("key1"), Some(42));
 /// assert_eq!(map.get("key1"), None);
 /// ```
-pub struct LockMap<K, V> {
+pub struct LockMap<K, V, S = RandomState> {
     shards: Vec<ShardMap<K, V>>,
-    hasher: RandomState,
+    hasher: S,
 }
 
-impl<K: Eq + Hash, V> Default for LockMap<K, V> {
+impl<K: Eq + Hash, V, S: BuildHasher + Default> Default for LockMap<K, V, S> {
     fn default() -> Self {
-        Self::new()
+        Self::with_capacity_and_shard_amount_and_hasher(0, default_shard_amount(), S::default())
     }
 }
 
@@ -185,16 +185,56 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
 
     /// Creates a new `LockMap` with the specified initial capacity and number of shards.
     pub fn with_capacity_and_shard_amount(capacity: usize, shard_amount: usize) -> Self {
+        Self::with_capacity_and_shard_amount_and_hasher(
+            capacity,
+            shard_amount,
+            RandomState::default(),
+        )
+    }
+}
+
+impl<K: Eq + Hash, V, S: BuildHasher> LockMap<K, V, S> {
+    /// Creates a new `LockMap` using the given hash builder.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lockmap::LockMap;
+    /// use std::collections::hash_map::RandomState;
+    ///
+    /// let map = LockMap::<String, u32, _>::with_hasher(RandomState::new());
+    /// map.insert("key".to_string(), 42);
+    /// assert_eq!(map.get("key"), Some(42));
+    /// ```
+    pub fn with_hasher(hasher: S) -> Self {
+        Self::with_capacity_and_shard_amount_and_hasher(0, default_shard_amount(), hasher)
+    }
+
+    /// Creates a new `LockMap` with the specified initial capacity, using the
+    /// given hash builder.
+    pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> Self {
+        Self::with_capacity_and_shard_amount_and_hasher(capacity, default_shard_amount(), hasher)
+    }
+
+    /// Creates a new `LockMap` with the specified initial capacity and number
+    /// of shards, using the given hash builder.
+    pub fn with_capacity_and_shard_amount_and_hasher(
+        capacity: usize,
+        shard_amount: usize,
+        hasher: S,
+    ) -> Self {
         assert!(shard_amount > 0, "shard_amount must be greater than 0");
         let per_shard_capacity = capacity.div_ceil(shard_amount);
         Self {
             shards: (0..shard_amount)
                 .map(|_| ShardMap::with_capacity(per_shard_capacity))
                 .collect(),
-            hasher: RandomState::default(),
+            hasher,
         }
     }
+}
 
+impl<K, V, S> LockMap<K, V, S> {
     /// Returns the number of elements in the map.
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.len()).sum()
@@ -209,12 +249,14 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
 
     /// Compute the shard index from the full hash value.
     ///
-    /// Uses the upper 32 bits of the hash for shard selection. The internal
-    /// `HashTable` uses the lower bits for bucket selection, so using the upper
-    /// bits avoids correlation between shard assignment and bucket placement.
+    /// Uses the upper 32 bits of the hash for shard selection via the
+    /// multiply-shift ("fastrange") technique, which avoids an integer modulo
+    /// and works for any shard count. The internal `HashTable` uses the lower
+    /// bits for bucket selection, so using the upper bits avoids correlation
+    /// between shard assignment and bucket placement.
     #[inline(always)]
     fn shard_index(&self, hash: u64) -> usize {
-        ((hash >> 32) as usize) % self.shards.len()
+        (((hash >> 32) * self.shards.len() as u64) >> 32) as usize
     }
 
     /// Rehash closure for `HashTable` growth — reuses the stored hash from
@@ -223,7 +265,9 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     fn state_hasher() -> impl Fn(&AliasableBox<State<K, V>>) -> u64 {
         |s| s.hash
     }
+}
 
+impl<K: Eq + Hash, V, S: BuildHasher> LockMap<K, V, S> {
     // ------------------------------------------------------------------
     // Public API
     // ------------------------------------------------------------------
@@ -245,7 +289,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     ///     entry.insert(42);
     /// }
     /// ```
-    pub fn entry(&self, key: K) -> Entry<'_, K, V> {
+    pub fn entry(&self, key: K) -> Entry<'_, K, V, S> {
         let ptr = self.acquire_state(key);
         self.guard(ptr)
     }
@@ -267,7 +311,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     /// drop(entry);
     /// assert!(map.try_entry("key".to_string()).is_some());
     /// ```
-    pub fn try_entry(&self, key: K) -> Option<Entry<'_, K, V>> {
+    pub fn try_entry(&self, key: K) -> Option<Entry<'_, K, V, S>> {
         let ptr = self.acquire_state(key);
         self.try_guard(ptr)
     }
@@ -311,7 +355,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     ///     entry.insert(42);
     /// }
     /// ```
-    pub fn entry_by_ref<Q>(&self, key: &Q) -> Entry<'_, K, V>
+    pub fn entry_by_ref<Q>(&self, key: &Q) -> Entry<'_, K, V, S>
     where
         K: Borrow<Q> + for<'c> From<&'c Q>,
         Q: Eq + Hash + ?Sized,
@@ -336,7 +380,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     /// drop(entry);
     /// assert!(map.try_entry_by_ref("key").is_some());
     /// ```
-    pub fn try_entry_by_ref<Q>(&self, key: &Q) -> Option<Entry<'_, K, V>>
+    pub fn try_entry_by_ref<Q>(&self, key: &Q) -> Option<Entry<'_, K, V, S>>
     where
         K: Borrow<Q> + for<'c> From<&'c Q>,
         Q: Eq + Hash + ?Sized,
@@ -673,13 +717,15 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     pub fn batch_lock<'a, M>(&'a self, keys: BTreeSet<K>) -> M
     where
         K: Clone,
-        M: FromIterator<(K, Entry<'a, K, V>)>,
+        M: FromIterator<(K, Entry<'a, K, V, S>)>,
     {
         keys.into_iter()
             .map(|key| (key.clone(), self.entry(key)))
             .collect()
     }
+}
 
+impl<K: Eq + Hash, V, S> LockMap<K, V, S> {
     /// Removes all key-value pairs from the map.
     ///
     /// Entries that are currently held by an [`Entry`] guard are cleared by
@@ -722,7 +768,121 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         }
     }
 
-    fn guard(&self, ptr: *mut State<K, V>) -> Entry<'_, K, V> {
+    /// Calls `f` for every key-value pair in the map.
+    ///
+    /// Entries that are not currently held are visited under the internal shard
+    /// lock; entries held by an [`Entry`] guard are visited afterwards by
+    /// waiting for the guard to be released. Consequently the iteration is not
+    /// an atomic snapshot: entries may be inserted or removed concurrently.
+    ///
+    /// **Locking behaviour:** Deadlock if `f` accesses this map or if called
+    /// when holding any entry of this map.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lockmap::LockMap;
+    ///
+    /// let map = LockMap::<u32, u32>::new();
+    /// map.insert(1, 10);
+    /// map.insert(2, 20);
+    ///
+    /// let mut sum = 0;
+    /// map.for_each(|_, v| sum += v);
+    /// assert_eq!(sum, 30);
+    /// ```
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&K, &V),
+    {
+        for shard in &self.shards {
+            let mut in_use: Vec<*mut State<K, V>> = Vec::new();
+            {
+                let inner = shard.inner.lock();
+                for s in inner.table.iter() {
+                    if s.flags().refcnt() == 0 {
+                        // SAFETY: refcnt == 0 → no guard exists, and none can be
+                        // created while the shard lock is held.
+                        if let Some(v) = unsafe { s.value_ref() } {
+                            f(&s.key, v);
+                        }
+                    } else {
+                        s.inc_ref();
+                        in_use.push(&**s as *const State<K, V> as *mut State<K, V>);
+                    }
+                }
+            }
+            for ptr in in_use {
+                let entry = self.guard(ptr);
+                if let Some(v) = entry.get() {
+                    f(entry.key(), v);
+                }
+            }
+        }
+    }
+
+    /// Retains only the key-value pairs for which `f` returns `true`.
+    ///
+    /// Entries that are not currently held are visited under the internal shard
+    /// lock; entries held by an [`Entry`] guard are visited afterwards by
+    /// waiting for the guard to be released.
+    ///
+    /// **Locking behaviour:** Deadlock if `f` accesses this map or if called
+    /// when holding any entry of this map.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lockmap::LockMap;
+    ///
+    /// let map = LockMap::<u32, u32>::new();
+    /// for i in 0..10 {
+    ///     map.insert(i, i);
+    /// }
+    /// map.retain(|_, v| *v % 2 == 0);
+    /// assert_eq!(map.len(), 5);
+    /// ```
+    pub fn retain<F>(&self, mut f: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        for shard in &self.shards {
+            let mut in_use: Vec<*mut State<K, V>> = Vec::new();
+            {
+                let mut inner = shard.inner.lock();
+                inner.table.retain(|s| {
+                    if s.flags().refcnt() == 0 {
+                        // SAFETY: refcnt == 0 → no guard exists, and none can be
+                        // created while the shard lock is held.
+                        match unsafe { s.value_mut() } {
+                            Some(v) => f(&s.key, v),
+                            None => false,
+                        }
+                    } else {
+                        s.inc_ref();
+                        in_use.push(&**s as *const State<K, V> as *mut State<K, V>);
+                        true
+                    }
+                });
+            }
+            for ptr in in_use {
+                let mut entry = self.guard(ptr);
+                // SAFETY: the key is immutable and lives as long as the guard;
+                // borrowing it independently of `entry` lets us pass it to `f`
+                // together with the mutable value borrow below.
+                let key: &K = unsafe { &(*ptr).key };
+                let keep = match entry.get_mut() {
+                    Some(v) => f(key, v),
+                    None => true,
+                };
+                if !keep {
+                    entry.remove();
+                }
+            }
+        }
+    }
+
+    fn guard(&self, ptr: *mut State<K, V>) -> Entry<'_, K, V, S> {
         // SAFETY: ptr is valid (ref-counted) and stable (AliasableBox).
         unsafe { (*ptr).mutex.lock() };
         Entry {
@@ -731,7 +891,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
         }
     }
 
-    fn try_guard(&self, ptr: *mut State<K, V>) -> Option<Entry<'_, K, V>> {
+    fn try_guard(&self, ptr: *mut State<K, V>) -> Option<Entry<'_, K, V, S>> {
         // SAFETY: ptr is valid (ref-counted) and stable (AliasableBox).
         if unsafe { (*ptr).mutex.try_lock() } {
             Some(Entry {
@@ -791,7 +951,7 @@ impl<K: Eq + Hash, V> LockMap<K, V> {
     }
 }
 
-impl<K, V> std::fmt::Debug for LockMap<K, V> {
+impl<K, V, S> std::fmt::Debug for LockMap<K, V, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LockMap").finish()
     }
@@ -820,8 +980,8 @@ impl<K, V> std::fmt::Debug for LockMap<K, V> {
 ///     entry.insert(42);
 /// }
 /// ```
-pub struct Entry<'a, K: Eq + Hash, V> {
-    map: &'a LockMap<K, V>,
+pub struct Entry<'a, K: Eq + Hash, V, S = RandomState> {
+    map: &'a LockMap<K, V, S>,
     state: *mut State<K, V>,
 }
 
@@ -829,9 +989,9 @@ pub struct Entry<'a, K: Eq + Hash, V> {
 // Entry is intentionally !Send — like MutexGuard, it should not be moved across threads.
 // For Sync, only K: Sync and V: Sync are needed: sharing &Entry across threads only
 // requires shared references (&K, &Option<V>) to be safe to share, not ownership transfer.
-unsafe impl<K: Eq + Hash + Sync, V: Sync> Sync for Entry<'_, K, V> {}
+unsafe impl<K: Eq + Hash + Sync, V: Sync, S: Sync> Sync for Entry<'_, K, V, S> {}
 
-impl<K: Eq + Hash, V> Entry<'_, K, V> {
+impl<K: Eq + Hash, V, S> Entry<'_, K, V, S> {
     /// Returns a reference to the entry's key.
     pub fn key(&self) -> &K {
         // SAFETY: The state pointer is valid for the lifetime of this guard
@@ -864,9 +1024,41 @@ impl<K: Eq + Hash, V> Entry<'_, K, V> {
     pub fn remove(&mut self) -> Option<V> {
         self.get_mut().take()
     }
+
+    /// Inserts `default` if the entry has no value, then returns a mutable
+    /// reference to the value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap::LockMap;
+    /// let map = LockMap::<&str, u32>::new();
+    /// *map.entry("counter").or_insert(0) += 1;
+    /// *map.entry("counter").or_insert(0) += 1;
+    /// assert_eq!(map.get("counter"), Some(2));
+    /// ```
+    pub fn or_insert(&mut self, default: V) -> &mut V {
+        self.get_mut().get_or_insert(default)
+    }
+
+    /// Inserts the value returned by `default` if the entry has no value, then
+    /// returns a mutable reference to the value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap::LockMap;
+    /// let map = LockMap::<&str, Vec<u32>>::new();
+    /// map.entry("list").or_insert_with(Vec::new).push(1);
+    /// map.entry("list").or_insert_with(Vec::new).push(2);
+    /// assert_eq!(map.get("list"), Some(vec![1, 2]));
+    /// ```
+    pub fn or_insert_with<F: FnOnce() -> V>(&mut self, default: F) -> &mut V {
+        self.get_mut().get_or_insert_with(default)
+    }
 }
 
-impl<K: Eq + Hash + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Entry<'_, K, V> {
+impl<K: Eq + Hash + std::fmt::Debug, V: std::fmt::Debug, S> std::fmt::Debug for Entry<'_, K, V, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Entry")
             .field("key", self.key())
@@ -875,7 +1067,7 @@ impl<K: Eq + Hash + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Ent
     }
 }
 
-impl<K: Eq + Hash, V> Drop for Entry<'_, K, V> {
+impl<K: Eq + Hash, V, S> Drop for Entry<'_, K, V, S> {
     fn drop(&mut self) {
         // 1. Update value state flag
         let has_value = self.get().is_some();
@@ -1368,6 +1560,125 @@ mod tests {
         assert!(map.is_empty());
         assert_eq!(map.get(&1), None);
         assert_eq!(map.get(&2), None);
+    }
+
+    #[test]
+    fn test_lockmap_custom_hasher() {
+        use std::collections::hash_map::RandomState as StdRandomState;
+
+        let map = LockMap::<String, u32, _>::with_hasher(StdRandomState::new());
+        map.insert("a".to_string(), 1);
+        assert_eq!(map.get("a"), Some(1));
+        {
+            let mut entry = map.entry("b".to_string());
+            entry.insert(2);
+        }
+        assert_eq!(map.remove("b"), Some(2));
+        assert_eq!(map.len(), 1);
+
+        let map = LockMap::<u32, u32, _>::with_capacity_and_hasher(100, StdRandomState::default());
+        for i in 0..100 {
+            map.insert(i, i);
+        }
+        assert_eq!(map.len(), 100);
+
+        let map: LockMap<u32, u32, StdRandomState> = LockMap::default();
+        map.insert(1, 1);
+        assert!(map.contains_key(&1));
+    }
+
+    #[test]
+    fn test_lockmap_for_each() {
+        let map = LockMap::<u32, u32>::new();
+        for i in 0..10 {
+            map.insert(i, i * 2);
+        }
+
+        let mut sum = 0;
+        let mut count = 0;
+        map.for_each(|k, v| {
+            assert_eq!(*v, k * 2);
+            sum += *v;
+            count += 1;
+        });
+        assert_eq!(count, 10);
+        assert_eq!(sum, (0..10).map(|i| i * 2).sum());
+    }
+
+    #[test]
+    fn test_lockmap_for_each_with_held_entry() {
+        let map = Arc::new(LockMap::<u32, u32>::new());
+        map.insert(1, 10);
+        let mut held = map.entry(2);
+        held.insert(20);
+
+        let visitor = {
+            let map = map.clone();
+            std::thread::spawn(move || {
+                let mut visited = Vec::new();
+                map.for_each(|k, v| visited.push((*k, *v)));
+                visited.sort();
+                visited
+            })
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(held);
+        assert_eq!(visitor.join().unwrap(), vec![(1, 10), (2, 20)]);
+    }
+
+    #[test]
+    fn test_lockmap_retain() {
+        let map = LockMap::<u32, u32>::new();
+        for i in 0..10 {
+            map.insert(i, i);
+        }
+        map.retain(|_, v| {
+            *v += 100;
+            *v % 2 == 0
+        });
+        assert_eq!(map.len(), 5);
+        for i in 0..10 {
+            if i % 2 == 0 {
+                assert_eq!(map.get(&i), Some(i + 100));
+            } else {
+                assert_eq!(map.get(&i), None);
+            }
+        }
+    }
+
+    #[test]
+    fn test_lockmap_retain_with_held_entry() {
+        let map = Arc::new(LockMap::<u32, u32>::new());
+        map.insert(1, 1);
+        let mut held = map.entry(2);
+        held.insert(2);
+
+        let retainer = {
+            let map = map.clone();
+            std::thread::spawn(move || map.retain(|_, v| *v % 2 == 0))
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(held);
+        retainer.join().unwrap();
+
+        assert_eq!(map.get(&1), None);
+        assert_eq!(map.get(&2), Some(2));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_lockmap_or_insert() {
+        let map = LockMap::<&str, u32>::new();
+        *map.entry("counter").or_insert(0) += 1;
+        *map.entry("counter").or_insert(0) += 1;
+        assert_eq!(map.get("counter"), Some(2));
+
+        let map = LockMap::<&str, Vec<u32>>::new();
+        map.entry("list").or_insert_with(Vec::new).push(1);
+        map.entry("list").or_insert_with(Vec::new).push(2);
+        assert_eq!(map.get("list"), Some(vec![1, 2]));
     }
 
     #[test]

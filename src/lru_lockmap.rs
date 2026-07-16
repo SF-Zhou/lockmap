@@ -327,9 +327,9 @@ impl<K, V> LruShardMap<K, V> {
 ///
 /// assert_eq!(cache.remove("b"), Some(2));
 /// ```
-pub struct LruLockMap<K, V> {
+pub struct LruLockMap<K, V, S = RandomState> {
     shards: Vec<LruShardMap<K, V>>,
-    hasher: RandomState,
+    hasher: S,
     /// Round-robin cursor for [`pop_lru`](Self::pop_lru) shard selection.
     pop_cursor: AtomicUsize,
 }
@@ -346,6 +346,41 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
     ///
     /// Each shard will have a capacity of `max_size / shard_amount` (rounded up).
     pub fn with_options(max_size: usize, initial_capacity: usize, shard_amount: usize) -> Self {
+        Self::with_options_and_hasher(
+            max_size,
+            initial_capacity,
+            shard_amount,
+            RandomState::default(),
+        )
+    }
+}
+
+impl<K: Eq + Hash, V, S: BuildHasher> LruLockMap<K, V, S> {
+    /// Creates a new `LruLockMap` with the given total capacity, using the
+    /// given hash builder.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lockmap::LruLockMap;
+    /// use std::collections::hash_map::RandomState;
+    ///
+    /// let cache = LruLockMap::<String, u32, _>::with_hasher(100, RandomState::new());
+    /// cache.insert("key".to_string(), 42);
+    /// assert_eq!(cache.get("key"), Some(42));
+    /// ```
+    pub fn with_hasher(max_size: usize, hasher: S) -> Self {
+        Self::with_options_and_hasher(max_size, 0, default_shard_amount(), hasher)
+    }
+
+    /// Creates a new `LruLockMap` with the given total capacity and number of
+    /// shards, using the given hash builder.
+    pub fn with_options_and_hasher(
+        max_size: usize,
+        initial_capacity: usize,
+        shard_amount: usize,
+        hasher: S,
+    ) -> Self {
         assert!(shard_amount > 0, "shard_amount must be greater than 0");
         let per_shard_max_size = max_size.div_ceil(shard_amount);
         let per_shard_capacity = initial_capacity.div_ceil(shard_amount);
@@ -353,11 +388,13 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
             shards: (0..shard_amount)
                 .map(|_| LruShardMap::with_capacity(per_shard_max_size, per_shard_capacity))
                 .collect(),
-            hasher: RandomState::default(),
+            hasher,
             pop_cursor: AtomicUsize::new(0),
         }
     }
+}
 
+impl<K, V, S> LruLockMap<K, V, S> {
     /// Returns the total number of entries across all shards.
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.len()).sum()
@@ -436,16 +473,25 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
 
     // --- shard routing ---
 
+    /// Compute the shard index from the full hash value.
+    ///
+    /// Uses the upper 32 bits of the hash for shard selection via the
+    /// multiply-shift ("fastrange") technique, which avoids an integer modulo
+    /// and works for any shard count. The internal `HashTable` uses the lower
+    /// bits for bucket selection, so using the upper bits avoids correlation
+    /// between shard assignment and bucket placement.
     #[inline(always)]
     fn shard_index(&self, hash: u64) -> usize {
-        ((hash >> 32) as usize) % self.shards.len()
+        (((hash >> 32) * self.shards.len() as u64) >> 32) as usize
     }
 
     #[inline(always)]
     fn state_hasher() -> impl Fn(&AliasableBox<State<K, V>>) -> u64 {
         |s| s.hash
     }
+}
 
+impl<K: Eq + Hash, V, S: BuildHasher> LruLockMap<K, V, S> {
     // ------------------------------------------------------------------
     // Public API
     // ------------------------------------------------------------------
@@ -468,7 +514,7 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
     ///     entry.insert(42);
     /// }
     /// ```
-    pub fn entry(&self, key: K) -> LruEntry<'_, K, V> {
+    pub fn entry(&self, key: K) -> LruEntry<'_, K, V, S> {
         let ptr = self.acquire_state(key);
         self.guard(ptr)
     }
@@ -491,7 +537,7 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
     /// drop(entry);
     /// assert!(cache.try_entry("key".to_string()).is_some());
     /// ```
-    pub fn try_entry(&self, key: K) -> Option<LruEntry<'_, K, V>> {
+    pub fn try_entry(&self, key: K) -> Option<LruEntry<'_, K, V, S>> {
         let ptr = self.acquire_state(key);
         self.try_guard(ptr)
     }
@@ -538,7 +584,7 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
     ///     entry.insert(42);
     /// }
     /// ```
-    pub fn entry_by_ref<Q>(&self, key: &Q) -> LruEntry<'_, K, V>
+    pub fn entry_by_ref<Q>(&self, key: &Q) -> LruEntry<'_, K, V, S>
     where
         K: Borrow<Q> + for<'c> From<&'c Q>,
         Q: Eq + Hash + ?Sized,
@@ -564,7 +610,7 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
     /// drop(entry);
     /// assert!(cache.try_entry_by_ref("key").is_some());
     /// ```
-    pub fn try_entry_by_ref<Q>(&self, key: &Q) -> Option<LruEntry<'_, K, V>>
+    pub fn try_entry_by_ref<Q>(&self, key: &Q) -> Option<LruEntry<'_, K, V, S>>
     where
         K: Borrow<Q> + for<'c> From<&'c Q>,
         Q: Eq + Hash + ?Sized,
@@ -928,7 +974,9 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
 
         self.guard(ptr).remove()
     }
+}
 
+impl<K: Eq + Hash, V, S> LruLockMap<K, V, S> {
     /// Removes and returns a least-recently-used entry from the cache.
     ///
     /// Since the LRU order is maintained **per shard**, the returned entry is
@@ -1016,7 +1064,135 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         }
     }
 
-    fn guard(&self, ptr: *mut State<K, V>) -> LruEntry<'_, K, V> {
+    /// Calls `f` for every key-value pair in the cache.
+    ///
+    /// Iteration does **not** promote entries in the LRU list. Entries that are
+    /// not currently held are visited under the internal shard lock; entries
+    /// held by an [`LruEntry`] guard are visited afterwards by waiting for the
+    /// guard to be released. Consequently the iteration is not an atomic
+    /// snapshot: entries may be inserted, removed or evicted concurrently.
+    ///
+    /// **Locking behaviour:** Deadlock if `f` accesses this cache or if called
+    /// when holding any entry of this cache.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap::LruLockMap;
+    /// let cache = LruLockMap::<u32, u32>::new(100);
+    /// cache.insert(1, 10);
+    /// cache.insert(2, 20);
+    ///
+    /// let mut sum = 0;
+    /// cache.for_each(|_, v| sum += v);
+    /// assert_eq!(sum, 30);
+    /// ```
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&K, &V),
+    {
+        for shard in &self.shards {
+            let mut in_use: Vec<*mut State<K, V>> = Vec::new();
+            {
+                let inner = shard.inner.lock();
+                for s in inner.table.iter() {
+                    if s.flags().refcnt() == 0 {
+                        // SAFETY: refcnt == 0 → no guard exists, and none can be
+                        // created while the shard lock is held.
+                        if let Some(v) = unsafe { s.value_ref() } {
+                            f(&s.key, v);
+                        }
+                    } else {
+                        s.inc_ref();
+                        in_use.push(&**s as *const State<K, V> as *mut State<K, V>);
+                    }
+                }
+            }
+            for ptr in in_use {
+                let entry = self.guard(ptr);
+                if let Some(v) = entry.get() {
+                    f(entry.key(), v);
+                }
+            }
+        }
+    }
+
+    /// Retains only the key-value pairs for which `f` returns `true`.
+    ///
+    /// Iteration does **not** promote entries in the LRU list. Entries that are
+    /// not currently held are visited under the internal shard lock; entries
+    /// held by an [`LruEntry`] guard are visited afterwards by waiting for the
+    /// guard to be released.
+    ///
+    /// **Locking behaviour:** Deadlock if `f` accesses this cache or if called
+    /// when holding any entry of this cache.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap::LruLockMap;
+    /// let cache = LruLockMap::<u32, u32>::new(100);
+    /// for i in 0..10 {
+    ///     cache.insert(i, i);
+    /// }
+    /// cache.retain(|_, v| *v % 2 == 0);
+    /// assert_eq!(cache.len(), 5);
+    /// ```
+    pub fn retain<F>(&self, mut f: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        for shard in &self.shards {
+            let mut in_use: Vec<*mut State<K, V>> = Vec::new();
+            {
+                let mut inner = shard.inner.lock();
+                let mut cursor = inner.head;
+                while !cursor.is_null() {
+                    // SAFETY: cursor is a valid node of this shard's list; the
+                    // shard mutex is held. `next` is read before any removal.
+                    let next = unsafe { *(*cursor).next.get() };
+                    let state = unsafe { &*cursor };
+                    if state.flags().refcnt() == 0 {
+                        // SAFETY: refcnt == 0 → no guard exists, and none can be
+                        // created while the shard lock is held.
+                        let keep = match unsafe { state.value_mut() } {
+                            Some(v) => f(&state.key, v),
+                            None => false,
+                        };
+                        if !keep {
+                            let hash = state.hash;
+                            unsafe { inner.detach(cursor) };
+                            if let Ok(entry) =
+                                inner.table.find_entry(hash, |s| std::ptr::eq(&**s, cursor))
+                            {
+                                let _ = entry.remove();
+                            }
+                        }
+                    } else {
+                        state.inc_ref();
+                        in_use.push(cursor);
+                    }
+                    cursor = next;
+                }
+            }
+            for ptr in in_use {
+                let mut entry = self.guard(ptr);
+                // SAFETY: the key is immutable and lives as long as the guard;
+                // borrowing it independently of `entry` lets us pass it to `f`
+                // together with the mutable value borrow below.
+                let key: &K = unsafe { &(*ptr).key };
+                let keep = match entry.get_mut() {
+                    Some(v) => f(key, v),
+                    None => true,
+                };
+                if !keep {
+                    entry.remove();
+                }
+            }
+        }
+    }
+
+    fn guard(&self, ptr: *mut State<K, V>) -> LruEntry<'_, K, V, S> {
         // SAFETY: ptr is valid (ref-counted) and stable (AliasableBox).
         unsafe { (*ptr).mutex.lock() };
         LruEntry {
@@ -1025,7 +1201,7 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         }
     }
 
-    fn try_guard(&self, ptr: *mut State<K, V>) -> Option<LruEntry<'_, K, V>> {
+    fn try_guard(&self, ptr: *mut State<K, V>) -> Option<LruEntry<'_, K, V, S>> {
         // SAFETY: ptr is valid (ref-counted) and stable (AliasableBox).
         if unsafe { (*ptr).mutex.try_lock() } {
             Some(LruEntry {
@@ -1087,13 +1263,13 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
     }
 }
 
-impl<K: Eq + Hash, V> Default for LruLockMap<K, V> {
+impl<K: Eq + Hash, V, S: BuildHasher + Default> Default for LruLockMap<K, V, S> {
     fn default() -> Self {
-        Self::new(usize::MAX)
+        Self::with_options_and_hasher(usize::MAX, 0, default_shard_amount(), S::default())
     }
 }
 
-impl<K, V> std::fmt::Debug for LruLockMap<K, V> {
+impl<K, V, S> std::fmt::Debug for LruLockMap<K, V, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LruLockMap").finish()
     }
@@ -1110,8 +1286,8 @@ impl<K, V> std::fmt::Debug for LruLockMap<K, V> {
 ///
 /// When dropped, this type automatically unlocks the entry and may trigger
 /// cleanup of empty entries.
-pub struct LruEntry<'a, K: Eq + Hash, V> {
-    map: &'a LruLockMap<K, V>,
+pub struct LruEntry<'a, K: Eq + Hash, V, S = RandomState> {
+    map: &'a LruLockMap<K, V, S>,
     state: *mut State<K, V>,
 }
 
@@ -1119,9 +1295,9 @@ pub struct LruEntry<'a, K: Eq + Hash, V> {
 // LruEntry is intentionally !Send — like MutexGuard, it should not be moved across threads.
 // For Sync, only K: Sync and V: Sync are needed: sharing &LruEntry across threads only
 // requires shared references (&K, &Option<V>) to be safe to share, not ownership transfer.
-unsafe impl<K: Eq + Hash + Sync, V: Sync> Sync for LruEntry<'_, K, V> {}
+unsafe impl<K: Eq + Hash + Sync, V: Sync, S: Sync> Sync for LruEntry<'_, K, V, S> {}
 
-impl<K: Eq + Hash, V> LruEntry<'_, K, V> {
+impl<K: Eq + Hash, V, S> LruEntry<'_, K, V, S> {
     /// Returns a reference to the entry's key.
     pub fn key(&self) -> &K {
         unsafe { &(*self.state).key }
@@ -1152,9 +1328,43 @@ impl<K: Eq + Hash, V> LruEntry<'_, K, V> {
     pub fn remove(&mut self) -> Option<V> {
         self.get_mut().take()
     }
+
+    /// Inserts `default` if the entry has no value, then returns a mutable
+    /// reference to the value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap::LruLockMap;
+    /// let cache = LruLockMap::<&str, u32>::new(100);
+    /// *cache.entry("counter").or_insert(0) += 1;
+    /// *cache.entry("counter").or_insert(0) += 1;
+    /// assert_eq!(cache.get("counter"), Some(2));
+    /// ```
+    pub fn or_insert(&mut self, default: V) -> &mut V {
+        self.get_mut().get_or_insert(default)
+    }
+
+    /// Inserts the value returned by `default` if the entry has no value, then
+    /// returns a mutable reference to the value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap::LruLockMap;
+    /// let cache = LruLockMap::<&str, Vec<u32>>::new(100);
+    /// cache.entry("list").or_insert_with(Vec::new).push(1);
+    /// cache.entry("list").or_insert_with(Vec::new).push(2);
+    /// assert_eq!(cache.get("list"), Some(vec![1, 2]));
+    /// ```
+    pub fn or_insert_with<F: FnOnce() -> V>(&mut self, default: F) -> &mut V {
+        self.get_mut().get_or_insert_with(default)
+    }
 }
 
-impl<K: Eq + Hash + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for LruEntry<'_, K, V> {
+impl<K: Eq + Hash + std::fmt::Debug, V: std::fmt::Debug, S> std::fmt::Debug
+    for LruEntry<'_, K, V, S>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LruEntry")
             .field("key", self.key())
@@ -1163,7 +1373,7 @@ impl<K: Eq + Hash + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Lru
     }
 }
 
-impl<K: Eq + Hash, V> Drop for LruEntry<'_, K, V> {
+impl<K: Eq + Hash, V, S> Drop for LruEntry<'_, K, V, S> {
     fn drop(&mut self) {
         // 1. Update value state flag
         let has_value = self.get().is_some();
@@ -2192,6 +2402,107 @@ mod tests {
 
         assert_eq!(total.load(Ordering::Acquire), N);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_lru_custom_hasher() {
+        use std::collections::hash_map::RandomState as StdRandomState;
+
+        let cache = LruLockMap::<String, u32, _>::with_hasher(100, StdRandomState::new());
+        cache.insert("a".to_string(), 1);
+        assert_eq!(cache.get("a"), Some(1));
+        {
+            let mut entry = cache.entry("b".to_string());
+            entry.insert(2);
+        }
+        assert_eq!(cache.remove("b"), Some(2));
+
+        // Eviction still works with a custom hasher.
+        let cache =
+            LruLockMap::<u32, u32, _>::with_options_and_hasher(3, 3, 1, StdRandomState::new());
+        for i in 0..5 {
+            cache.insert(i, i);
+        }
+        assert_eq!(cache.len(), 3);
+
+        let cache: LruLockMap<u32, u32, StdRandomState> = LruLockMap::default();
+        cache.insert(1, 1);
+        assert!(cache.contains_key(&1));
+    }
+
+    #[test]
+    fn test_lru_for_each_does_not_promote() {
+        let cache = LruLockMap::<u32, u32>::with_options(3, 3, 1);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        cache.insert(3, 30);
+
+        let mut sum = 0;
+        cache.for_each(|_, v| sum += *v);
+        assert_eq!(sum, 60);
+
+        // Iteration must not promote: key=1 is still the LRU entry.
+        cache.insert(4, 40);
+        assert_eq!(cache.peek(&1), None);
+        assert_eq!(cache.peek(&2), Some(20));
+    }
+
+    #[test]
+    fn test_lru_retain() {
+        let cache = LruLockMap::<u32, u32>::with_options(10, 10, 1);
+        for i in 0..10 {
+            cache.insert(i, i);
+        }
+        cache.retain(|_, v| *v % 2 == 0);
+        assert_eq!(cache.len(), 5);
+
+        // The LRU list must remain consistent after retain: eviction works and
+        // pop_lru drains in order.
+        for i in 10..18 {
+            cache.insert(i, i);
+        }
+        assert_eq!(cache.len(), 10);
+
+        let mut popped = 0;
+        while cache.pop_lru().is_some() {
+            popped += 1;
+        }
+        assert_eq!(popped, 10);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_lru_retain_with_held_entry() {
+        let cache = Arc::new(LruLockMap::<u32, u32>::new(100));
+        cache.insert(1, 1);
+        let mut held = cache.entry(2);
+        held.insert(2);
+
+        let retainer = {
+            let cache = cache.clone();
+            std::thread::spawn(move || cache.retain(|_, v| *v % 2 == 0))
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(held);
+        retainer.join().unwrap();
+
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), Some(2));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_lru_or_insert() {
+        let cache = LruLockMap::<&str, u32>::new(100);
+        *cache.entry("counter").or_insert(0) += 1;
+        *cache.entry("counter").or_insert(0) += 1;
+        assert_eq!(cache.get("counter"), Some(2));
+
+        let cache = LruLockMap::<&str, Vec<u32>>::new(100);
+        cache.entry("list").or_insert_with(Vec::new).push(1);
+        cache.entry("list").or_insert_with(Vec::new).push(2);
+        assert_eq!(cache.get("list"), Some(vec![1, 2]));
     }
 
     #[test]

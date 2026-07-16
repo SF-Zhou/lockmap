@@ -28,6 +28,8 @@ Unlike standard concurrent maps that might lock the entire map or large buckets,
 *   **Sharding Architecture**: Internal sharding reduces contention on the map structure itself during insertions and removals.
 *   **Deadlock Prevention**: Provides `batch_lock` to safely acquire locks on multiple keys simultaneously using a deterministic order.
 *   **Non-Blocking Locking**: `try_entry` / `try_entry_by_ref` return `None` instead of blocking when a key is already held.
+*   **Iteration**: `for_each` / `retain` visit all entries shard by shard, without a global lock.
+*   **Pluggable Hasher**: both maps accept a custom `BuildHasher` via `with_hasher` constructors (default: `foldhash`).
 *   **Single Hash Computation**: Each key is hashed once; the pre-computed hash is stored alongside the key and reused for shard selection, table probing, and rehashing.
 *   **No Key Duplication**: Uses `hashbrown::HashTable` so each key is stored only once, inside the entry state.
 *   **Entry API**: Ergonomic unified RAII guard (`Entry`) for managing locks.
