@@ -20,6 +20,7 @@
 //! - **Deadlock prevention**: `LockMap` provides [`batch_lock`](LockMap::batch_lock) for safe multi-key locking
 //! - **Non-blocking locking**: [`try_entry`](LockMap::try_entry) returns `None` instead of blocking when a key is held
 //! - **LRU eviction**: `LruLockMap` automatically evicts least recently used entries when capacity is exceeded
+//! - **LRU inspection**: [`peek`](LruLockMap::peek) reads without promoting; [`pop_lru`](LruLockMap::pop_lru) removes a least-recently-used entry
 //! - **Non-blocking eviction**: In-use entries are skipped during eviction; traversal continues to the next candidate
 //!
 //! # Examples

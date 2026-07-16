@@ -95,6 +95,7 @@ assert!(map.is_empty());
 
 *   **Per-Key Locking**: Same fine-grained locking as `LockMap`.
 *   **Per-Shard LRU Eviction**: Each shard independently tracks access order and evicts least recently used entries when capacity is exceeded.
+*   **`peek` / `pop_lru`**: Read a value without promoting it in the LRU list, or explicitly remove a least-recently-used entry.
 *   **Non-Blocking Eviction**: In-use entries are skipped during eviction; traversal continues to the next candidate, ensuring progress even when the tail is held.
 *   **Intrusive Linked List**: LRU bookkeeping uses pointers embedded directly in each entry, avoiding extra allocations.
 *   **No Key Duplication**: Uses `hashbrown::HashTable` so each key is stored only once, inside the entry state.
@@ -118,8 +119,11 @@ assert_eq!(cache.get("key"), Some("value".into()));
     entry.insert("new_value".to_string());
 }
 
-// Remove a value
-assert_eq!(cache.remove("key"), Some("new_value".into()));
+// Peek without promoting the entry in the LRU list
+assert_eq!(cache.peek("key"), Some("new_value".into()));
+
+// Explicitly pop a least-recently-used entry
+assert_eq!(cache.pop_lru(), Some(("key".to_string(), "new_value".to_string())));
 
 // When the cache exceeds capacity, the least recently used
 // entries are automatically evicted.
