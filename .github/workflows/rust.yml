@@ -27,6 +27,24 @@ jobs:
     - name: Clippy
       run: cargo clippy --all-targets -- -D warnings
 
+  msrv:
+    name: MSRV (1.75)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: "1.75"
+
+    # The committed Cargo.lock uses lockfile v4, which cargo 1.75 cannot
+    # parse; regenerate it with the MSRV toolchain for this check.
+    - name: Check with MSRV
+      run: |
+        rm -f Cargo.lock
+        cargo check --lib
+
   test:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -100,3 +118,19 @@ jobs:
 
       - name: Run Miri tests
         run: cargo miri test --lib
+
+  tsan:
+    name: Thread Sanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly with rust-src
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Run tests under ThreadSanitizer
+        run: cargo test --lib --release --target x86_64-unknown-linux-gnu -Zbuild-std
+        env:
+          RUSTFLAGS: -Zsanitizer=thread

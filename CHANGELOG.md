@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expand benchmarks with multi-threaded workloads: concurrent get, mixed
   get/insert, hot-key entry contention, LRU `get` vs `peek`, and mixed workload
   under eviction pressure
+- Add generic hasher support: `LockMap<K, V, S>` and `LruLockMap<K, V, S>` with
+  `with_hasher` / `with_capacity_and_hasher` / `with_capacity_and_shard_amount_and_hasher`
+  / `with_options_and_hasher` constructors (default hasher unchanged: `foldhash`)
+- Add `for_each` and `retain` to `LockMap` and `LruLockMap` (LRU iteration does
+  not promote entries)
+- Add `or_insert` / `or_insert_with` to `Entry` and `LruEntry`
 
 ### Changed
 
@@ -24,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously, a panic inside `V::clone()` during `get()` poisoned the shard and made
   all subsequent operations on that shard panic
 - Check reference-count overflow with `debug_assert` in debug builds
+- Compute shard index with the branch-free multiply-shift ("fastrange")
+  technique instead of an integer modulo
 
 ### Internal
 
@@ -36,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Run Miri on the whole library test suite (`cargo miri test --lib`)
 - Add a lint job enforcing `cargo fmt --check` and `cargo clippy -- -D warnings`
+- Add an MSRV (1.75) check job
+- Add a ThreadSanitizer job running the library tests on nightly
 
 ## [0.2.2] - 2026-04-27
 
