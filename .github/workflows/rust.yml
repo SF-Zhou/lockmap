@@ -78,6 +78,14 @@ jobs:
     - name: Test
       run: cargo test --target ${{ matrix.target }}
 
+    - name: Run examples
+      shell: bash
+      run: |
+        set -euo pipefail
+        for example in singleflight rate_limiter lru_session_store; do
+          cargo run --example "$example" --target ${{ matrix.target }}
+        done
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest

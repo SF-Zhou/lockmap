@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Declare `rust-version` (MSRV 1.75) and crates.io `keywords` / `categories` metadata
 - Pin dev-dependency versions (`criterion = "0.8"`, `rand = "0.10"`)
 
+### Documentation
+
+- Add runnable examples: `singleflight` (request coalescing), `rate_limiter`
+  (per-key token bucket) and `lru_session_store` (bounded session cache)
+- README: add installation/MSRV section, capability comparison matrix,
+  non-reentrancy caveat and explicit dual-license statement
+
 ### CI
 
 - Run Miri on the whole library test suite (`cargo miri test --lib`)
