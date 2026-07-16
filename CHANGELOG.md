@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add non-blocking `try_entry` / `try_entry_by_ref` to `LockMap` and `LruLockMap`
 - Add `clear` to `LockMap` and `LruLockMap`
+- Add `peek` to `LruLockMap`: read a value without promoting it in the LRU list
+- Add `pop_lru` to `LruLockMap`: remove and return a least-recently-used entry
+  (per shard, round-robin across shards; in-use entries are skipped)
+- Expand benchmarks with multi-threaded workloads: concurrent get, mixed
+  get/insert, hot-key entry contention, LRU `get` vs `peek`, and mixed workload
+  under eviction pressure
 
 ### Changed
 

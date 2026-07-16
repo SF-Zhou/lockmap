@@ -8,7 +8,7 @@ use parking_lot::{Mutex, RawMutex};
 use std::borrow::Borrow;
 use std::cell::UnsafeCell;
 use std::hash::{BuildHasher, Hash};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // State – per-key state with intrusive LRU list pointers
@@ -215,6 +215,40 @@ impl<K, V> LruShardInner<K, V> {
             cursor = prev;
         }
     }
+
+    /// Removes and returns the least-recently-used entry of this shard.
+    ///
+    /// Walks from the tail (LRU end) towards the head (MRU end). Entries that
+    /// are currently in use (refcnt > 0) are skipped. Returns `None` if no
+    /// removable entry exists.
+    fn pop_lru(&mut self) -> Option<(K, V)> {
+        let mut cursor = self.tail;
+        while !cursor.is_null() {
+            // SAFETY: cursor is a valid node of this shard's list; the shard
+            // mutex is held. `prev` is read before any removal.
+            let prev = unsafe { *(*cursor).prev.get() };
+            let state = unsafe { &*cursor };
+
+            if state.flags().refcnt() == 0 {
+                let hash = state.hash;
+                // SAFETY: refcnt == 0 → no guard exists; safe to detach and remove.
+                unsafe { self.detach(cursor) };
+                if let Ok(entry) = self.table.find_entry(hash, |s| std::ptr::eq(&**s, cursor)) {
+                    let (state_box, _) = entry.remove();
+                    // SAFETY: the state is no longer shared: it has been removed
+                    // from the table and the list, and refcnt == 0.
+                    let state = AliasableBox::into_unique(state_box);
+                    let State { key, value, .. } = *state;
+                    if let Some(value) = value.into_inner() {
+                        return Some((key, value));
+                    }
+                    // Entry without a value; keep scanning.
+                }
+            }
+            cursor = prev;
+        }
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +330,8 @@ impl<K, V> LruShardMap<K, V> {
 pub struct LruLockMap<K, V> {
     shards: Vec<LruShardMap<K, V>>,
     hasher: RandomState,
+    /// Round-robin cursor for [`pop_lru`](Self::pop_lru) shard selection.
+    pop_cursor: AtomicUsize,
 }
 
 impl<K: Eq + Hash, V> LruLockMap<K, V> {
@@ -318,6 +354,7 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
                 .map(|_| LruShardMap::with_capacity(per_shard_max_size, per_shard_capacity))
                 .collect(),
             hasher: RandomState::default(),
+            pop_cursor: AtomicUsize::new(0),
         }
     }
 
@@ -624,6 +661,62 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         self.guard(ptr).get().clone()
     }
 
+    /// Gets the value associated with the given key **without** promoting it
+    /// in the LRU list.
+    ///
+    /// Unlike [`get`](Self::get), calling `peek` does not affect the eviction
+    /// order: the entry keeps its current position in the LRU list.
+    ///
+    /// **Locking behaviour:** Deadlock if called when holding the same entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap::LruLockMap;
+    /// let cache = LruLockMap::<String, u32>::new(100);
+    /// cache.insert("key".to_string(), 42);
+    /// assert_eq!(cache.peek("key"), Some(42));
+    /// assert_eq!(cache.peek("missing"), None);
+    /// ```
+    pub fn peek<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        V: Clone,
+        Q: Eq + Hash + ?Sized,
+    {
+        let hash = self.hasher.hash_one(key);
+        let shard = &self.shards[self.shard_index(hash)];
+        let mut ptr: *mut State<K, V> = std::ptr::null_mut();
+
+        let value = {
+            let inner = shard.inner.lock();
+            let p = inner
+                .table
+                .find(hash, |s| s.key.borrow() == key)
+                .map(|s| &**s as *const State<K, V> as *mut State<K, V>)
+                .unwrap_or(std::ptr::null_mut());
+            if !p.is_null() {
+                let state = unsafe { &*p };
+                if state.flags().refcnt() == 0 {
+                    // SAFETY: refcnt == 0 means no Entry guard exists.
+                    unsafe { state.value_ref() }.clone()
+                } else {
+                    state.inc_ref();
+                    ptr = p;
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if ptr.is_null() {
+            return value;
+        }
+
+        self.guard(ptr).get().clone()
+    }
+
     /// Inserts a value into the cache, returning the previous value if any.
     ///
     /// **Locking behaviour:** Deadlock if called when holding the same entry.
@@ -834,6 +927,41 @@ impl<K: Eq + Hash, V> LruLockMap<K, V> {
         };
 
         self.guard(ptr).remove()
+    }
+
+    /// Removes and returns a least-recently-used entry from the cache.
+    ///
+    /// Since the LRU order is maintained **per shard**, the returned entry is
+    /// the least recently used of a single shard, not necessarily of the whole
+    /// cache. Shards are visited in round-robin order across calls so repeated
+    /// invocations drain all shards fairly.
+    ///
+    /// Entries that are currently held by an [`LruEntry`] guard are skipped,
+    /// mirroring the eviction policy. Returns `None` if no removable entry
+    /// exists.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lockmap::LruLockMap;
+    /// let cache = LruLockMap::<u32, u32>::with_options(10, 10, 1);
+    /// cache.insert(1, 10);
+    /// cache.insert(2, 20);
+    /// cache.get(&1); // promote key=1
+    /// assert_eq!(cache.pop_lru(), Some((2, 20)));
+    /// assert_eq!(cache.pop_lru(), Some((1, 10)));
+    /// assert_eq!(cache.pop_lru(), None);
+    /// ```
+    pub fn pop_lru(&self) -> Option<(K, V)> {
+        let shard_count = self.shards.len();
+        let start = self.pop_cursor.fetch_add(1, Ordering::Relaxed) % shard_count;
+        for i in 0..shard_count {
+            let shard = &self.shards[(start + i) % shard_count];
+            if let Some(kv) = shard.inner.lock().pop_lru() {
+                return Some(kv);
+            }
+        }
+        None
     }
 
     /// Removes all key-value pairs from the cache.
@@ -1927,6 +2055,142 @@ mod tests {
 
         // Clearing an empty cache is a no-op.
         cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    // --- peek / pop_lru ---
+
+    #[test]
+    fn test_lru_peek_basic() {
+        let cache = LruLockMap::<String, u32>::new(100);
+        assert_eq!(cache.peek("missing"), None);
+        cache.insert("key".to_string(), 42);
+        assert_eq!(cache.peek("key"), Some(42));
+        // Peeking does not remove or modify the value.
+        assert_eq!(cache.get("key"), Some(42));
+    }
+
+    #[test]
+    fn test_lru_peek_does_not_promote() {
+        let cache = LruLockMap::<u32, u32>::with_options(3, 3, 1);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        cache.insert(3, 30);
+
+        // Peek key=1: unlike get, this must NOT promote it.
+        assert_eq!(cache.peek(&1), Some(10));
+
+        cache.insert(4, 40);
+        assert_eq!(cache.peek(&1), None); // still evicted as LRU
+        assert_eq!(cache.peek(&2), Some(20));
+        assert_eq!(cache.peek(&3), Some(30));
+        assert_eq!(cache.peek(&4), Some(40));
+    }
+
+    #[test]
+    fn test_lru_peek_held_entry() {
+        let cache = Arc::new(LruLockMap::<u32, u32>::new(100));
+        cache.insert(1, 10);
+
+        let entry = cache.entry(1);
+        let peeker = {
+            let cache = cache.clone();
+            // peek on a held key blocks until the guard is released.
+            std::thread::spawn(move || cache.peek(&1))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(entry);
+        assert_eq!(peeker.join().unwrap(), Some(10));
+    }
+
+    #[test]
+    fn test_lru_pop_lru_order() {
+        let cache = LruLockMap::<u32, u32>::with_options(10, 10, 1);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        cache.insert(3, 30);
+
+        // Promote key=1; LRU order becomes 2, 3, 1.
+        assert_eq!(cache.get(&1), Some(10));
+
+        assert_eq!(cache.pop_lru(), Some((2, 20)));
+        assert_eq!(cache.pop_lru(), Some((3, 30)));
+        assert_eq!(cache.pop_lru(), Some((1, 10)));
+        assert_eq!(cache.pop_lru(), None);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_lru_pop_lru_skips_in_use() {
+        let cache = LruLockMap::<u32, u32>::with_options(10, 10, 1);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+
+        // Hold key=1 (the LRU tail); pop_lru must skip it.
+        let held = cache.entry(1);
+        assert_eq!(cache.pop_lru(), Some((2, 20)));
+        assert_eq!(cache.pop_lru(), None); // only the held entry remains
+        drop(held);
+
+        assert_eq!(cache.pop_lru(), Some((1, 10)));
+    }
+
+    #[test]
+    fn test_lru_pop_lru_skips_empty_entry() {
+        let cache = LruLockMap::<u32, u32>::with_options(10, 10, 1);
+        // A held entry without a value must not be returned.
+        let held = cache.entry(1);
+        assert_eq!(cache.pop_lru(), None);
+        drop(held);
+        assert_eq!(cache.pop_lru(), None);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_lru_pop_lru_multi_shard() {
+        let cache = LruLockMap::<u32, u32>::with_options(100, 0, 4);
+        for i in 0..10 {
+            cache.insert(i, i * 10);
+        }
+
+        let mut popped = std::collections::BTreeSet::new();
+        while let Some((k, v)) = cache.pop_lru() {
+            assert_eq!(v, k * 10);
+            assert!(popped.insert(k), "duplicate key {k}");
+        }
+        assert_eq!(popped.len(), 10);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_lru_pop_lru_concurrent() {
+        let cache = Arc::new(LruLockMap::<u32, u32>::with_options(1 << 16, 0, 4));
+        #[cfg(not(miri))]
+        const N: u32 = 1 << 10;
+        #[cfg(miri)]
+        const N: u32 = 1 << 5;
+        const M: usize = 4;
+
+        for i in 0..N {
+            cache.insert(i, i);
+        }
+
+        let total = Arc::new(AtomicU32::new(0));
+        let threads: Vec<_> = (0..M)
+            .map(|_| {
+                let cache = cache.clone();
+                let total = total.clone();
+                std::thread::spawn(move || {
+                    while let Some((k, v)) = cache.pop_lru() {
+                        assert_eq!(k, v);
+                        total.fetch_add(1, Ordering::AcqRel);
+                    }
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+
+        assert_eq!(total.load(Ordering::Acquire), N);
         assert!(cache.is_empty());
     }
 
