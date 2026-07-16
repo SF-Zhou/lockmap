@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Add non-blocking `try_entry` / `try_entry_by_ref` to `LockMap` and `LruLockMap`
+- Add `clear` to `LockMap` and `LruLockMap`
+
+### Changed
+
+- Use `parking_lot::Mutex` for internal shard locks. This removes lock poisoning:
+  previously, a panic inside `V::clone()` during `get()` poisoned the shard and made
+  all subsequent operations on that shard panic
+- Check reference-count overflow with `debug_assert` in debug builds
+
+### Internal
+
+- Deduplicate shared internals (`StateFlags`, shard sizing, guard release logic)
+- Attach README doctests via the `#[cfg(doctest)]` idiom instead of a private module
+- Declare `rust-version` (MSRV 1.75) and crates.io `keywords` / `categories` metadata
+- Pin dev-dependency versions (`criterion = "0.8"`, `rand = "0.10"`)
+
+### CI
+
+- Run Miri on the whole library test suite (`cargo miri test --lib`)
+- Add a lint job enforcing `cargo fmt --check` and `cargo clippy -- -D warnings`
+
 ## [0.2.2] - 2026-04-27
 
 ### Added
@@ -31,6 +57,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking:** Consolidate workspace into a single crate; migrate to `parking_lot` mutex and `HashTable`-based `LockMap` with a unified `Entry` API (#30)
+
+  Migration guide:
+
+  | 0.1.x | 0.2.0 |
+  |-------|-------|
+  | `use lockmap::EntryByVal` | `use lockmap::Entry` |
+  | `use lockmap::EntryByRef` | `use lockmap::Entry` |
+  | `use lockmap_lru::LruLockMap` | `use lockmap::LruLockMap` |
+  | `use lockmap_lru::LruEntry` | `use lockmap::LruEntry` |
 
 ### Added
 

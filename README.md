@@ -27,6 +27,7 @@ Unlike standard concurrent maps that might lock the entire map or large buckets,
 *   **Key-Level Locking**: Acquire exclusive locks for specific keys. Operations on different keys run in parallel.
 *   **Sharding Architecture**: Internal sharding reduces contention on the map structure itself during insertions and removals.
 *   **Deadlock Prevention**: Provides `batch_lock` to safely acquire locks on multiple keys simultaneously using a deterministic order.
+*   **Non-Blocking Locking**: `try_entry` / `try_entry_by_ref` return `None` instead of blocking when a key is already held.
 *   **Single Hash Computation**: Each key is hashed once; the pre-computed hash is stored alongside the key and reused for shard selection, table probing, and rehashing.
 *   **No Key Duplication**: Uses `hashbrown::HashTable` so each key is stored only once, inside the entry state.
 *   **Entry API**: Ergonomic unified RAII guard (`Entry`) for managing locks.
@@ -58,10 +59,15 @@ assert_eq!(map.get("key"), Some("value".into()));
     entry.insert("new value".to_string());
 } // Lock is automatically released here
 
-// 4. Remove a value
-assert_eq!(map.remove("key"), Some("new value".into()));
+// 4. Non-blocking access: returns None if the key is currently held
+if let Some(mut entry) = map.try_entry_by_ref("key") {
+    entry.insert("another value".to_string());
+}
 
-// 5. Batch Locking (Deadlock safe)
+// 5. Remove a value
+assert_eq!(map.remove("key"), Some("another value".into()));
+
+// 6. Batch Locking (Deadlock safe)
 // Acquires locks for multiple keys in a deterministic order.
 let mut keys = BTreeSet::new();
 keys.insert("key1".to_string());
@@ -74,6 +80,11 @@ if let Some(entry) = locked_entries.get_mut("key1") {
    entry.insert("updated_in_batch".into());
 }
 // All locks released when `locked_entries` is dropped
+drop(locked_entries);
+
+// 7. Clear the map (waits for held entries, like `remove`)
+map.clear();
+assert!(map.is_empty());
 ```
 
 ## LruLockMap
@@ -128,28 +139,7 @@ The `map.get(key)` method clones the value while holding an internal shard lock.
 
 ## Changelog
 
-### 0.2.0
-
-This is a major restructuring release. The previous workspace of three crates (`lockmap`, `lockmap-lru`, `lockmap-core`) has been consolidated into a single `lockmap` crate.
-
-#### Breaking Changes
-
-*   **Unified crate**: `lockmap-lru` and `lockmap-core` no longer exist as separate crates. Import both `LockMap` and `LruLockMap` from `lockmap`:
-    ```rust
-    use lockmap::{LockMap, LruLockMap};
-    ```
-*   **Unified `Entry` type**: The separate `EntryByVal` and `EntryByRef` types in `LockMap` have been replaced by a single [`Entry`](https://docs.rs/lockmap/latest/lockmap/struct.Entry.html) type. The key is now stored inside the entry state and accessed via `entry.key()`.
-*   **`parking_lot` mutex**: The custom futex-based mutex and `atomic-wait` dependency have been replaced by `parking_lot::RawMutex`.
-*   **`HashTable` storage for `LockMap`**: `LockMap` now uses `hashbrown::HashTable` (like `LruLockMap`) with the key and pre-computed hash stored in the entry state. Each operation hashes the key only once.
-
-#### Migration Guide
-
-| 0.1.x | 0.2.0 |
-|-------|-------|
-| `use lockmap::EntryByVal` | `use lockmap::Entry` |
-| `use lockmap::EntryByRef` | `use lockmap::Entry` |
-| `use lockmap_lru::LruLockMap` | `use lockmap::LruLockMap` |
-| `use lockmap_lru::LruEntry` | `use lockmap::LruEntry` |
+See [CHANGELOG.md](CHANGELOG.md) for release notes and migration guides.
 
 ## License
 
