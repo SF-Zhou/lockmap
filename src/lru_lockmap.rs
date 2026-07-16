@@ -180,17 +180,22 @@ impl<K, V> LruShardInner<K, V> {
                 let hash = state.hash;
                 // SAFETY: refcnt == 0 → no guard exists; safe to detach and remove.
                 unsafe { self.detach(cursor) };
-                if let Ok(entry) = self.table.find_entry(hash, |s| std::ptr::eq(&**s, cursor)) {
-                    let (state_box, _) = entry.remove();
-                    // SAFETY: the state is no longer shared: it has been removed
-                    // from the table and the list, and refcnt == 0.
-                    let state = AliasableBox::into_unique(state_box);
-                    let State { key, value, .. } = *state;
-                    if let Some(value) = value.into_inner() {
-                        return Some((key, value));
-                    }
-                    // Entry without a value; keep scanning.
+                // Every node in the LRU list is owned by the table, so the
+                // lookup cannot fail.
+                let entry = self
+                    .table
+                    .find_entry(hash, |s| std::ptr::eq(&**s, cursor))
+                    .ok()
+                    .expect("lockmap: entry in the LRU list must exist in the table");
+                let (state_box, _) = entry.remove();
+                // SAFETY: the state is no longer shared: it has been removed
+                // from the table and the list, and refcnt == 0.
+                let state = AliasableBox::into_unique(state_box);
+                let State { key, value, .. } = *state;
+                if let Some(value) = value.into_inner() {
+                    return Some((key, value));
                 }
+                // Entry without a value; keep scanning.
             }
             cursor = prev;
         }
@@ -1371,6 +1376,23 @@ mod tests {
         Arc,
     };
 
+    /// White-box helper: puts the unheld entry for `key` into the defensive
+    /// valueless state (refcnt == 0, no value) that iteration code must
+    /// tolerate but that cannot be produced through the public API.
+    fn make_valueless(cache: &LruLockMap<u32, u32>, key: u32) {
+        for shard in &cache.shards {
+            let inner = shard.inner.lock();
+            for s in inner.table.iter() {
+                if s.key == key {
+                    // SAFETY: the shard lock is held and refcnt == 0, so no
+                    // guard exists and none can be created concurrently.
+                    unsafe { (*s.value.get()).take() };
+                    s.set_value_state(false);
+                }
+            }
+        }
+    }
+
     // --- basic operations ---
 
     #[test]
@@ -2361,6 +2383,30 @@ mod tests {
     }
 
     #[test]
+    fn test_lru_pop_lru_skips_unheld_entry_without_value() {
+        // White-box test: an unheld entry in the defensive valueless state is
+        // removed during the scan and skipped; scanning continues towards the
+        // head.
+        let cache = LruLockMap::<u32, u32>::with_options(10, 10, 1);
+        cache.insert(1, 10); // LRU tail
+        cache.insert(2, 20); // MRU head
+        make_valueless(&cache, 1);
+
+        // pop_lru starts at the tail (key 1), drops the valueless entry and
+        // keeps scanning until it finds key 2.
+        assert_eq!(cache.pop_lru(), Some((2, 20)));
+        assert!(cache.is_empty()); // key 1 was removed by the scan
+        assert_eq!(cache.pop_lru(), None);
+
+        // A cache containing only a valueless entry: the scan removes it and
+        // reaches the head without returning anything.
+        cache.insert(3, 30);
+        make_valueless(&cache, 3);
+        assert_eq!(cache.pop_lru(), None);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
     fn test_lru_pop_lru_multi_shard() {
         let cache = LruLockMap::<u32, u32>::with_options(100, 0, 4);
         for i in 0..10 {
@@ -2558,18 +2604,7 @@ mod tests {
         let cache = LruLockMap::<u32, u32>::with_options(10, 10, 1);
         cache.insert(1, 1);
         cache.insert(2, 2);
-
-        for shard in &cache.shards {
-            let inner = shard.inner.lock();
-            for s in inner.table.iter() {
-                if s.key == 1 {
-                    // SAFETY: the shard lock is held and refcnt == 0, so no
-                    // guard exists and none can be created concurrently.
-                    unsafe { (*s.value.get()).take() };
-                    s.set_value_state(false);
-                }
-            }
-        }
+        make_valueless(&cache, 1);
 
         let mut visited = Vec::new();
         cache.for_each(|k, v| visited.push((*k, *v)));
