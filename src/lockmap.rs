@@ -1581,6 +1581,90 @@ mod tests {
     }
 
     #[test]
+    fn test_lockmap_retain_removes_held_entry() {
+        // A held entry for which `f` returns false must be removed via the
+        // in-use path (`entry.remove()`), not the shard pass.
+        let map = Arc::new(LockMap::<u32, u32>::new());
+        map.insert(2, 2);
+        let mut held = map.entry(1);
+        held.insert(1);
+
+        let retainer = {
+            let map = map.clone();
+            std::thread::spawn(move || map.retain(|_, v| *v % 2 == 0))
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(held);
+        retainer.join().unwrap();
+
+        assert_eq!(map.get(&1), None);
+        assert_eq!(map.get(&2), Some(2));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_lockmap_retain_held_entry_without_value() {
+        // A held entry with no value is visited via the in-use path; `f` is
+        // not called for it and the entry is kept (cleanup happens when the
+        // guard is dropped).
+        let map = Arc::new(LockMap::<u32, u32>::new());
+        map.insert(1, 1);
+        let held = map.entry(2); // held, but no value is ever inserted
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let retainer = {
+            let map = map.clone();
+            let calls = calls.clone();
+            std::thread::spawn(move || {
+                map.retain(|_, _| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    false
+                })
+            })
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(held);
+        retainer.join().unwrap();
+
+        // `f` was only called for key 1; the valueless held entry was skipped
+        // and cleaned up on guard drop.
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_lockmap_retain_unheld_entry_without_value() {
+        // White-box test: simulate the defensive state of an unheld entry
+        // (refcnt == 0) without a value; `retain` must drop it without
+        // calling `f`.
+        let map = LockMap::<u32, u32>::new();
+        map.insert(1, 1);
+        map.insert(2, 2);
+
+        for shard in &map.shards {
+            let inner = shard.inner.lock();
+            for s in inner.table.iter() {
+                if s.key == 1 {
+                    // SAFETY: the shard lock is held and refcnt == 0, so no
+                    // guard exists and none can be created concurrently.
+                    unsafe { (*s.value.get()).take() };
+                    s.set_value_state(false);
+                }
+            }
+        }
+
+        map.retain(|k, _| {
+            assert_ne!(*k, 1, "valueless entry must not be visited");
+            true
+        });
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&1), None);
+        assert_eq!(map.get(&2), Some(2));
+    }
+
+    #[test]
     fn test_lockmap_or_insert() {
         let map = LockMap::<&str, u32>::new();
         *map.entry("counter").or_insert(0) += 1;

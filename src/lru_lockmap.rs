@@ -2497,6 +2497,144 @@ mod tests {
     }
 
     #[test]
+    fn test_lru_retain_removes_held_entry() {
+        // A held entry for which `f` returns false must be removed via the
+        // in-use path (`entry.remove()`), not the shard pass.
+        let cache = Arc::new(LruLockMap::<u32, u32>::new(100));
+        cache.insert(2, 2);
+        let mut held = cache.entry(1);
+        held.insert(1);
+
+        let retainer = {
+            let cache = cache.clone();
+            std::thread::spawn(move || cache.retain(|_, v| *v % 2 == 0))
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(held);
+        retainer.join().unwrap();
+
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), Some(2));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_lru_retain_held_entry_without_value() {
+        // A held entry with no value is visited via the in-use path; `f` is
+        // not called for it and the entry is kept (cleanup happens when the
+        // guard is dropped).
+        let cache = Arc::new(LruLockMap::<u32, u32>::new(100));
+        cache.insert(1, 1);
+        let held = cache.entry(2); // held, but no value is ever inserted
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let retainer = {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            std::thread::spawn(move || {
+                cache.retain(|_, _| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    false
+                })
+            })
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(held);
+        retainer.join().unwrap();
+
+        // `f` was only called for key 1; the valueless held entry was skipped
+        // and cleaned up on guard drop.
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_lru_retain_unheld_entry_without_value() {
+        // White-box test: simulate the defensive state of an unheld entry
+        // (refcnt == 0) without a value; `retain` must detach it from the LRU
+        // list and drop it without calling `f`. `for_each` must skip it.
+        let cache = LruLockMap::<u32, u32>::with_options(10, 10, 1);
+        cache.insert(1, 1);
+        cache.insert(2, 2);
+
+        for shard in &cache.shards {
+            let inner = shard.inner.lock();
+            for s in inner.table.iter() {
+                if s.key == 1 {
+                    // SAFETY: the shard lock is held and refcnt == 0, so no
+                    // guard exists and none can be created concurrently.
+                    unsafe { (*s.value.get()).take() };
+                    s.set_value_state(false);
+                }
+            }
+        }
+
+        let mut visited = Vec::new();
+        cache.for_each(|k, v| visited.push((*k, *v)));
+        assert_eq!(visited, vec![(2, 2)]);
+
+        cache.retain(|k, _| {
+            assert_ne!(*k, 1, "valueless entry must not be visited");
+            true
+        });
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.peek(&1), None);
+        assert_eq!(cache.peek(&2), Some(2));
+
+        // The LRU list must remain consistent after the removal.
+        assert_eq!(cache.pop_lru(), Some((2, 2)));
+        assert_eq!(cache.pop_lru(), None);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_lru_for_each_with_held_entry() {
+        // A held entry is visited via the in-use path after its guard is
+        // released.
+        let cache = Arc::new(LruLockMap::<u32, u32>::new(100));
+        cache.insert(1, 10);
+        let mut held = cache.entry(2);
+        held.insert(20);
+
+        let visitor = {
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                let mut visited = Vec::new();
+                cache.for_each(|k, v| visited.push((*k, *v)));
+                visited.sort();
+                visited
+            })
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(held);
+        assert_eq!(visitor.join().unwrap(), vec![(1, 10), (2, 20)]);
+    }
+
+    #[test]
+    fn test_lru_for_each_held_entry_without_value() {
+        // A held entry with no value is skipped by `for_each`.
+        let cache = Arc::new(LruLockMap::<u32, u32>::new(100));
+        cache.insert(1, 10);
+        let held = cache.entry(2); // held, but no value is ever inserted
+
+        let visitor = {
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                let mut visited = Vec::new();
+                cache.for_each(|k, v| visited.push((*k, *v)));
+                visited
+            })
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(held);
+        assert_eq!(visitor.join().unwrap(), vec![(1, 10)]);
+    }
+
+    #[test]
     fn test_lru_or_insert() {
         let cache = LruLockMap::<&str, u32>::new(100);
         *cache.entry("counter").or_insert(0) += 1;
