@@ -1,87 +1,16 @@
-use crate::common::{default_shard_amount, StateFlags};
+use crate::common::default_shard_amount;
 use aliasable::boxed::AliasableBox;
 use foldhash::fast::RandomState;
 use hashbrown::hash_table::Entry as TableEntry;
 use hashbrown::HashTable;
 use parking_lot::lock_api::RawMutex as _;
-use parking_lot::{Mutex, RawMutex};
+use parking_lot::Mutex;
 use std::borrow::Borrow;
-use std::cell::UnsafeCell;
 use std::collections::BTreeSet;
 use std::hash::{BuildHasher, Hash};
-use std::sync::atomic::{AtomicU32, Ordering};
 
-// ---------------------------------------------------------------------------
-// State – per-key state with key and pre-computed hash
-// ---------------------------------------------------------------------------
-
-struct State<K, V> {
-    key: K,
-    hash: u64,
-    flags: AtomicU32,
-    mutex: RawMutex,
-    value: UnsafeCell<Option<V>>,
-}
-
-impl<K, V> State<K, V> {
-    fn new(key: K, value: Option<V>, refcnt: u32, hash: u64) -> AliasableBox<Self> {
-        AliasableBox::from_unique(Box::new(Self {
-            key,
-            hash,
-            flags: AtomicU32::new(StateFlags::new(refcnt, value.is_some()).0),
-            mutex: RawMutex::INIT,
-            value: UnsafeCell::new(value),
-        }))
-    }
-
-    fn flags(&self) -> StateFlags {
-        StateFlags(self.flags.load(Ordering::Acquire))
-    }
-
-    /// Increments the reference count.
-    ///
-    /// # Note
-    ///
-    /// The reference count uses 31 bits, supporting up to 2^31 - 1 concurrent
-    /// references. Overflow is checked in debug builds only.
-    fn inc_ref(&self) -> StateFlags {
-        let old = self.flags.fetch_add(1, Ordering::AcqRel);
-        debug_assert!(
-            StateFlags(old).refcnt() < StateFlags::REFCNT_MASK,
-            "lockmap: reference count overflow"
-        );
-        StateFlags(old + 1)
-    }
-
-    fn dec_ref(&self) -> StateFlags {
-        StateFlags(self.flags.fetch_sub(1, Ordering::AcqRel) - 1)
-    }
-
-    fn set_value_state(&self, has_value: bool) {
-        if has_value {
-            self.flags
-                .fetch_or(StateFlags::HAS_VALUE_FLAG, Ordering::Release);
-        } else {
-            self.flags
-                .fetch_and(!StateFlags::HAS_VALUE_FLAG, Ordering::Release);
-        }
-    }
-
-    /// # Safety
-    ///
-    /// The caller must ensure that the internal `mutex` is locked.
-    unsafe fn value_ref(&self) -> &Option<V> {
-        &*self.value.get()
-    }
-
-    /// # Safety
-    ///
-    /// The caller must ensure that the internal `mutex` is locked and they have exclusive access.
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn value_mut(&self) -> &mut Option<V> {
-        &mut *self.value.get()
-    }
-}
+/// Per-key entry state without extra link payload (see [`crate::common::State`]).
+type State<K, V> = crate::common::State<K, V, ()>;
 
 // ---------------------------------------------------------------------------
 // ShardInner – HashTable storage
@@ -911,26 +840,9 @@ impl<K: Eq + Hash, V, S> LockMap<K, V, S> {
     fn release_ref(&self, state: *mut State<K, V>) {
         let state_ref = unsafe { &*state };
 
-        // CAS loop to decrement the reference count.
-        let mut current = state_ref.flags.load(Ordering::Acquire);
-        loop {
-            let flags = StateFlags(current);
-
-            // If this is the last reference and no value, proceed to cleanup.
-            if flags.refcnt() == 1 && !flags.has_value() {
-                break;
-            }
-
-            let new_flags = StateFlags::new(flags.refcnt() - 1, flags.has_value());
-            match state_ref.flags.compare_exchange_weak(
-                current,
-                new_flags.0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return, // Not the last reference or still has value.
-                Err(actual) => current = actual,
-            }
+        // Fast path: CAS-decrement unless cleanup is required.
+        if !state_ref.release_ref_needs_cleanup() {
+            return;
         }
 
         // Acquire shard lock using the stored hash (no re-hashing).

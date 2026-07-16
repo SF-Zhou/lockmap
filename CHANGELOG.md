@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `for_each` and `retain` to `LockMap` and `LruLockMap` (LRU iteration does
   not promote entries)
 - Add `or_insert` / `or_insert_with` to `Entry` and `LruEntry`
+- Add `batch_lock` to `LruLockMap` for deadlock-safe multi-key locking
 
 ### Changed
 
@@ -35,7 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
-- Deduplicate shared internals (`StateFlags`, shard sizing, guard release logic)
+- Deduplicate shared internals: the per-key `State` (generic over an optional
+  link payload), `StateFlags`, the reference-release CAS protocol and shard
+  sizing now live in a common module used by both maps
 - Attach README doctests via the `#[cfg(doctest)]` idiom instead of a private module
 - Declare `rust-version` (MSRV 1.75) and crates.io `keywords` / `categories` metadata
 - Pin dev-dependency versions (`criterion = "0.8"`, `rand = "0.10"`)
