@@ -1,92 +1,39 @@
-use crate::common::{default_shard_amount, StateFlags};
+use crate::common::default_shard_amount;
 use aliasable::boxed::AliasableBox;
 use foldhash::fast::RandomState;
 use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
 use parking_lot::lock_api::RawMutex as _;
-use parking_lot::{Mutex, RawMutex};
+use parking_lot::Mutex;
 use std::borrow::Borrow;
 use std::cell::UnsafeCell;
+use std::collections::BTreeSet;
 use std::hash::{BuildHasher, Hash};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // State – per-key state with intrusive LRU list pointers
 // ---------------------------------------------------------------------------
 
-struct State<K, V> {
-    key: K,
-    hash: u64,
-    flags: AtomicU32,
-    mutex: RawMutex,
-    value: UnsafeCell<Option<V>>,
-    // Intrusive doubly-linked list pointers for LRU ordering.
-    // These are only accessed while the shard's `parking_lot::Mutex` is held.
-    prev: UnsafeCell<*mut Self>,
-    next: UnsafeCell<*mut Self>,
+/// Intrusive doubly-linked list pointers for LRU ordering.
+///
+/// These are only accessed while the shard's `parking_lot::Mutex` is held.
+struct Links<K, V> {
+    prev: UnsafeCell<*mut State<K, V>>,
+    next: UnsafeCell<*mut State<K, V>>,
 }
 
-impl<K, V> State<K, V> {
-    fn new(key: K, value: Option<V>, refcnt: u32, hash: u64) -> AliasableBox<Self> {
-        AliasableBox::from_unique(Box::new(Self {
-            key,
-            hash,
-            flags: AtomicU32::new(StateFlags::new(refcnt, value.is_some()).0),
-            mutex: RawMutex::INIT,
-            value: UnsafeCell::new(value),
+impl<K, V> Default for Links<K, V> {
+    fn default() -> Self {
+        Self {
             prev: UnsafeCell::new(std::ptr::null_mut()),
             next: UnsafeCell::new(std::ptr::null_mut()),
-        }))
-    }
-
-    fn flags(&self) -> StateFlags {
-        StateFlags(self.flags.load(Ordering::Acquire))
-    }
-
-    /// Increments the reference count.
-    ///
-    /// # Note
-    ///
-    /// The reference count uses 31 bits, supporting up to 2^31 - 1 concurrent
-    /// references. Overflow is checked in debug builds only.
-    fn inc_ref(&self) -> StateFlags {
-        let old = self.flags.fetch_add(1, Ordering::AcqRel);
-        debug_assert!(
-            StateFlags(old).refcnt() < StateFlags::REFCNT_MASK,
-            "lockmap: reference count overflow"
-        );
-        StateFlags(old + 1)
-    }
-
-    fn dec_ref(&self) -> StateFlags {
-        StateFlags(self.flags.fetch_sub(1, Ordering::AcqRel) - 1)
-    }
-
-    fn set_value_state(&self, has_value: bool) {
-        if has_value {
-            self.flags
-                .fetch_or(StateFlags::HAS_VALUE_FLAG, Ordering::Release);
-        } else {
-            self.flags
-                .fetch_and(!StateFlags::HAS_VALUE_FLAG, Ordering::Release);
         }
     }
-
-    /// # Safety
-    ///
-    /// The caller must ensure that the internal `mutex` is locked.
-    unsafe fn value_ref(&self) -> &Option<V> {
-        &*self.value.get()
-    }
-
-    /// # Safety
-    ///
-    /// The caller must ensure that the internal `mutex` is locked and they have exclusive access.
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn value_mut(&self) -> &mut Option<V> {
-        &mut *self.value.get()
-    }
 }
+
+/// Per-key entry state carrying the LRU list pointers (see [`crate::common::State`]).
+type State<K, V> = crate::common::State<K, V, Links<K, V>>;
 
 // ---------------------------------------------------------------------------
 // LruShardInner – HashTable + intrusive doubly-linked LRU list
@@ -128,23 +75,23 @@ impl<K, V> LruShardInner<K, V> {
     /// `node` must be a valid, non-null pointer to a State that is currently in
     /// this shard's linked list. The shard mutex must be held.
     unsafe fn detach(&mut self, node: *mut State<K, V>) {
-        let prev = *(*node).prev.get();
-        let next = *(*node).next.get();
+        let prev = *(*node).links.prev.get();
+        let next = *(*node).links.next.get();
 
         if !prev.is_null() {
-            *(*prev).next.get() = next;
+            *(*prev).links.next.get() = next;
         } else {
             self.head = next;
         }
 
         if !next.is_null() {
-            *(*next).prev.get() = prev;
+            *(*next).links.prev.get() = prev;
         } else {
             self.tail = prev;
         }
 
-        *(*node).prev.get() = std::ptr::null_mut();
-        *(*node).next.get() = std::ptr::null_mut();
+        *(*node).links.prev.get() = std::ptr::null_mut();
+        *(*node).links.next.get() = std::ptr::null_mut();
     }
 
     /// Push `node` to the front (head) of the doubly-linked list.
@@ -154,11 +101,11 @@ impl<K, V> LruShardInner<K, V> {
     /// `node` must be a valid, non-null pointer to a State that is NOT currently
     /// in the list (prev/next must be null). The shard mutex must be held.
     unsafe fn push_front(&mut self, node: *mut State<K, V>) {
-        *(*node).next.get() = self.head;
-        *(*node).prev.get() = std::ptr::null_mut();
+        *(*node).links.next.get() = self.head;
+        *(*node).links.prev.get() = std::ptr::null_mut();
 
         if !self.head.is_null() {
-            *(*self.head).prev.get() = node;
+            *(*self.head).links.prev.get() = node;
         }
         self.head = node;
         if self.tail.is_null() {
@@ -196,7 +143,7 @@ impl<K, V> LruShardInner<K, V> {
             && cursor != current
             && evicted < self.max_evict
         {
-            let prev = unsafe { *(*cursor).prev.get() };
+            let prev = unsafe { *(*cursor).links.prev.get() };
             let state = unsafe { &*cursor };
 
             if state.flags().refcnt() > 0 {
@@ -226,7 +173,7 @@ impl<K, V> LruShardInner<K, V> {
         while !cursor.is_null() {
             // SAFETY: cursor is a valid node of this shard's list; the shard
             // mutex is held. `prev` is read before any removal.
-            let prev = unsafe { *(*cursor).prev.get() };
+            let prev = unsafe { *(*cursor).links.prev.get() };
             let state = unsafe { &*cursor };
 
             if state.flags().refcnt() == 0 {
@@ -974,6 +921,45 @@ impl<K: Eq + Hash, V, S: BuildHasher> LruLockMap<K, V, S> {
 
         self.guard(ptr).remove()
     }
+
+    /// Acquires exclusive locks for a batch of keys in a deadlock-safe manner.
+    ///
+    /// Takes a `BTreeSet` of keys, ensuring they are processed and locked
+    /// in a consistent, sorted order across all threads. Each key is promoted
+    /// in the LRU list; keys held by the returned guards cannot be evicted
+    /// while the guards are alive.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use lockmap::LruLockMap;
+    /// use std::collections::BTreeSet;
+    ///
+    /// let cache = LruLockMap::<u32, u32>::new(100);
+    /// cache.insert(1, 100);
+    /// cache.insert(2, 200);
+    ///
+    /// let mut keys = BTreeSet::new();
+    /// keys.insert(1);
+    /// keys.insert(2);
+    ///
+    /// let mut locked = cache.batch_lock::<std::collections::HashMap<_, _>>(keys);
+    /// locked.get_mut(&1).and_then(|entry| entry.insert(101));
+    /// locked.get_mut(&2).and_then(|entry| entry.insert(201));
+    /// drop(locked);
+    ///
+    /// assert_eq!(cache.get(&1), Some(101));
+    /// assert_eq!(cache.get(&2), Some(201));
+    /// ```
+    pub fn batch_lock<'a, M>(&'a self, keys: BTreeSet<K>) -> M
+    where
+        K: Clone,
+        M: FromIterator<(K, LruEntry<'a, K, V, S>)>,
+    {
+        keys.into_iter()
+            .map(|key| (key.clone(), self.entry(key)))
+            .collect()
+    }
 }
 
 impl<K: Eq + Hash, V, S> LruLockMap<K, V, S> {
@@ -1039,7 +1025,7 @@ impl<K: Eq + Hash, V, S> LruLockMap<K, V, S> {
                 while !cursor.is_null() {
                     // SAFETY: cursor is a valid node of this shard's list; the
                     // shard mutex is held. `next` is read before any removal.
-                    let next = unsafe { *(*cursor).next.get() };
+                    let next = unsafe { *(*cursor).links.next.get() };
                     let state = unsafe { &*cursor };
                     if state.flags().refcnt() == 0 {
                         // SAFETY: refcnt == 0 → no guard exists; safe to drop.
@@ -1150,7 +1136,7 @@ impl<K: Eq + Hash, V, S> LruLockMap<K, V, S> {
                 while !cursor.is_null() {
                     // SAFETY: cursor is a valid node of this shard's list; the
                     // shard mutex is held. `next` is read before any removal.
-                    let next = unsafe { *(*cursor).next.get() };
+                    let next = unsafe { *(*cursor).links.next.get() };
                     let state = unsafe { &*cursor };
                     if state.flags().refcnt() == 0 {
                         // SAFETY: refcnt == 0 → no guard exists, and none can be
@@ -1222,26 +1208,9 @@ impl<K: Eq + Hash, V, S> LruLockMap<K, V, S> {
     fn release_ref(&self, state: *mut State<K, V>) {
         let state_ref = unsafe { &*state };
 
-        // CAS loop to decrement the reference count.
-        let mut current = state_ref.flags.load(Ordering::Acquire);
-        loop {
-            let flags = StateFlags(current);
-
-            // If this is the last reference and no value, proceed to cleanup.
-            if flags.refcnt() == 1 && !flags.has_value() {
-                break;
-            }
-
-            let new_flags = StateFlags::new(flags.refcnt() - 1, flags.has_value());
-            match state_ref.flags.compare_exchange_weak(
-                current,
-                new_flags.0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return, // Not the last reference or still has value.
-                Err(actual) => current = actual,
-            }
+        // Fast path: CAS-decrement unless cleanup is required.
+        if !state_ref.release_ref_needs_cleanup() {
+            return;
         }
 
         // Acquire shard lock using the stored hash (no re-hashing).
@@ -2266,6 +2235,41 @@ mod tests {
         // Clearing an empty cache is a no-op.
         cache.clear();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_lru_random_batch_lock() {
+        let cache = Arc::new(LruLockMap::<u32, u32>::with_options(256, 256, 16));
+        let total = Arc::new(AtomicU32::default());
+        #[cfg(not(miri))]
+        const N: usize = 1 << 14;
+        #[cfg(miri)]
+        const N: usize = 1 << 6;
+        const M: usize = 8;
+
+        let threads = (0..M)
+            .map(|_| {
+                let cache = cache.clone();
+                let total = total.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..N {
+                        let keys = (0..3).map(|_| rand::random::<u32>() % 32).collect();
+                        let mut entries: std::collections::HashMap<_, _> = cache.batch_lock(keys);
+                        for entry in entries.values_mut() {
+                            assert!(entry.get().is_none());
+                            entry.insert(1);
+                        }
+                        total.fetch_add(1, Ordering::AcqRel);
+                        for entry in entries.values_mut() {
+                            entry.remove();
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+
+        assert_eq!(total.load(Ordering::Acquire) as usize, N * M);
     }
 
     // --- peek / pop_lru ---
